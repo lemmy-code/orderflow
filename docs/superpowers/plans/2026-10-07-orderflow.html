@@ -1,0 +1,2698 @@
+<!doctype html><html lang=en><head><meta charset=utf-8><meta name=viewport content='width=device-width,initial-scale=1'><title>orderflow Implementation Plan</title><style>
+:root{--bg:#fafaf8;--fg:#1d1d1f;--muted:#6b6b70;--line:#e3e3e0;--accent:#2f5bd3;--box:#f1f3f8}
+@media (prefers-color-scheme:dark){:root{--bg:#161618;--fg:#ececee;--muted:#a0a0a8;--line:#2e2e33;--accent:#7aa2ff;--box:#1f2128}}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--fg);
+font:17px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI",Inter,Roboto,sans-serif}
+main{max-width:860px;margin:0 auto;padding:32px 20px 80px}
+h1{font-size:1.7em;line-height:1.25;margin:0 0 .6em}h2{font-size:1.3em;margin:2em 0 .6em;padding-top:.6em;border-top:1px solid var(--line)}
+h3{font-size:1.1em;margin:1.5em 0 .4em}p{margin:.6em 0}a{color:var(--accent)}
+code{background:var(--box);padding:.1em .35em;border-radius:5px;font-size:.92em}
+pre{background:var(--box);padding:14px;border-radius:8px;overflow-x:auto}pre code{background:none;padding:0}
+blockquote{margin:1em 0;padding:.6em 1em;border-left:4px solid var(--accent);background:var(--box);border-radius:0 8px 8px 0}
+table{border-collapse:collapse;width:100%;margin:1em 0;font-size:.95em;display:block;overflow-x:auto}
+th,td{border:1px solid var(--line);padding:8px 10px;text-align:left;vertical-align:top}th{background:var(--box)}
+.toc{background:var(--box);border-radius:10px;padding:14px 18px;margin:1em 0 2em}.toc ol{margin:.4em 0 0}
+h2{scroll-margin-top:12px}ul,ol{padding-left:1.4em}li{margin:.25em 0}hr{border:0;border-top:1px solid var(--line);margin:2em 0}
+</style></head><body><main><h1 id="orderflow-implementation-plan">orderflow Implementation Plan</h1>
+<blockquote><strong>For agentic workers:</strong> REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (<code>- [ ]</code>) syntax for tracking.</blockquote>
+<p><strong>Goal:</strong> Two event-driven NestJS services (orders, inventory) linked only by Kafka, with a transactional outbox, idempotent consumers, a DLQ, and unit, integration and e2e tests that run in CI from a clean checkout.</p>
+<p><strong>Architecture:</strong> NestJS monorepo with <code>apps/orders</code> (GraphQL, code-first Apollo), <code>apps/inventory</code> (Kafka consumer only), <code>libs/contracts</code> (event types and the payload validator) and <code>libs/messaging</code> (Kafka setup, outbox, idempotency guard, consumer with retry and DLQ). Each service owns its own PostgreSQL database; all state changes and their outgoing events are written in one DB transaction and published later by an outbox loop.</p>
+<p><strong>Tech Stack:</strong> Node 22 (CI/Docker; Node 25 locally is fine), TypeScript ~5.9 (strict), NestJS, <code>@nestjs/graphql</code> + <code>@nestjs/apollo</code> + <code>@apollo/server</code>, TypeORM + <code>pg</code>, KafkaJS, Jest + ts-jest, Supertest, Testcontainers (<code>@testcontainers/postgresql</code>, <code>@testcontainers/kafka</code>), ESLint (typescript-eslint), Docker Compose, GitHub Actions.</p>
+<p><strong>Spec:</strong> <code>docs/superpowers/specs/2026-10-07-orderflow-design.md</code> (read §10: the revisions made while planning).</p>
+<h2 id="global-constraints">Global Constraints</h2>
+<ul><li>Repository root: <code>~/Documents/GitHub/orderflow</code>. All documentation stays inside this repository (<code>docs/</code>, <code>README.md</code>).</li><li><strong>Docker must be running locally</strong> for integration tests, e2e tests and Compose (<code>docker info</code> succeeds). CI has Docker.</li><li>TypeScript <code>strict: true</code>; no <code>any</code> (ESLint <code>no-explicit-any: error</code>).</li><li>Topics are exactly <code>order-events</code>, <code>stock-events</code>, <code>order-events.dlq</code>, <code>stock-events.dlq</code>; every message key is the <code>orderId</code>.</li><li>Event <code>type</code>s are exactly <code>order.created</code>, <code>order.paid</code>, <code>order.cancelled</code>, <code>stock.reserved</code>, <code>stock.rejected</code>.</li><li>Order statuses are exactly <code>PENDING | RESERVED | REJECTED | PAID | CANCELLED</code>; GraphQL error codes are exactly <code>BAD_USER_INPUT</code>, <code>NOT_FOUND</code>, <code>INVALID_STATE</code>; rejection reasons are exactly <code>INSUFFICIENT_STOCK</code>, <code>UNKNOWN_PRODUCT</code>.</li><li>Retry: 3 attempts in total with exponential backoff (base 200 ms), then DLQ; a payload that fails validation goes to the DLQ on the first attempt.</li><li><strong>Env vars are read only inside functions called at module-init time, never at import time, and every one has a local default.</strong> The app must start and the tests must pass with no <code>.env</code> file (the Speechify lesson).</li><li><code>orders(first)</code> defaults to 20, is capped at 100; <code>first &lt; 1</code> is <code>BAD_USER_INPUT</code>.</li><li>Order input limits: 1–50 lines, quantity an integer 1–1000, <code>productId</code> a UUID, no duplicate <code>productId</code>.</li><li>Seeded products (fixed IDs, used by tests and README): keyboard <code>11111111-1111-4111-8111-111111111111</code> (8999¢, stock 10), mouse <code>22222222-2222-4222-8222-222222222222</code> (2999¢, stock 5), monitor <code>33333333-3333-4333-8333-333333333333</code> (24999¢, stock 1).</li><li>Commit after every task with a conventional-commit message ending in the <code>Co-Authored-By</code> trailer the session uses. Do not push until the user says so.</li></ul>
+<h2 id="review-focus">Review Focus</h2>
+<ol><li><strong>Malformed <code>createOrder</code> input</strong> (empty list, quantity 0 / -1 / 1001 / 1.5, 51 lines, the same product twice, a non-UUID productId) → <code>BAD_USER_INPUT</code> and nothing saved. Pinned in Task 3 (unit) and Task 6 (GraphQL int test).</li><li><strong>A non-UUID <code>id</code></strong> passed to <code>order</code>, <code>payOrder</code> or <code>cancelOrder</code> → <code>BAD_USER_INPUT</code>, never a Postgres "invalid input syntax" 500. Pinned in Task 5 and Task 6.</li><li><strong>Kafka down when the outbox publishes</strong> → the API keeps accepting orders, rows stay unsent, and they go out once Kafka is back. Pinned in Task 4.</li><li><strong>The same product twice inside one <code>order.created</code> that bypassed the API</strong> (another producer, a replay) → quantities summed, one reservation row per product. Pinned in Task 7 (unit) and Task 8 (int).</li><li><strong>Pagination abuse</strong> (<code>first: 1000</code>, <code>first: 0</code>, a garbage <code>after</code> cursor) → capped at 100, <code>BAD_USER_INPUT</code>, <code>BAD_USER_INPUT</code>. Pinned in Task 3 (unit) and Task 5 (int).</li></ol>
+<hr>
+<h2 id="file-structure">File structure</h2>
+<pre><code>orderflow/
+├── package.json  tsconfig.json  nest-cli.json  jest.config.js  eslint.config.mjs  .prettierrc  .gitignore
+├── Dockerfile  docker-compose.yml  docker/postgres-init.sql
+├── .github/workflows/ci.yml
+├── README.md
+├── libs/contracts/src/            topics.ts  events.ts  envelope.ts  parse.ts  parse.spec.ts  index.ts
+├── libs/messaging/src/            retry.ts  retry.spec.ts  consumer.ts  consumer.spec.ts  kafka.ts
+│                                  idempotency.ts  outbox.ts  schema.ts  logger.ts  index.ts
+├── apps/orders/src/
+│   ├── main.ts  app.module.ts  config.ts  health.controller.ts  messaging.lifecycle.ts  data-source.ts
+│   ├── migrations/1728300000000-init-orders.ts
+│   └── orders/  order-status.ts  order-state.ts(+spec)  order-input.ts(+spec)  pagination.ts(+spec)  errors.ts
+│                order.entity.ts  order-item.entity.ts  orders.service.ts  graphql.models.ts  orders.resolver.ts  graphql-errors.ts
+├── apps/inventory/src/
+│   ├── main.ts  app.module.ts  config.ts  messaging.lifecycle.ts  data-source.ts
+│   ├── migrations/1728300000001-init-inventory.ts
+│   └── stock/  stock.ts(+spec)  seed.ts  product.entity.ts  reservation.entity.ts  reservation.service.ts
+└── test/
+    ├── support/  timeout.ts  postgres.ts  kafka.ts  wait-for.ts  fake-producer.ts
+    ├── int/      messaging.int-spec.ts  orders.int-spec.ts  orders-graphql.int-spec.ts  inventory.int-spec.ts
+    └── e2e/      orderflow.e2e-spec.ts</code></pre>
+<p>Each <code><em>.spec.ts</code> is a unit test (no I/O). <code></em>.int-spec.ts</code> uses Testcontainers PostgreSQL. <code>*.e2e-spec.ts</code> uses PostgreSQL + Kafka and both apps.</p>
+<hr>
+<h3 id="task-1-scaffold-the-monorepo-and-libs-contracts">Task 1: Scaffold the monorepo and <code>libs/contracts</code></h3>
+<p><strong>Files:</strong></p>
+<ul><li>Create: <code>package.json</code>, <code>tsconfig.json</code>, <code>nest-cli.json</code>, <code>jest.config.js</code>, <code>eslint.config.mjs</code>, <code>.prettierrc</code>, <code>apps/orders/tsconfig.app.json</code>, <code>apps/inventory/tsconfig.app.json</code>, <code>libs/contracts/tsconfig.lib.json</code>, <code>libs/messaging/tsconfig.lib.json</code>, <code>test/support/timeout.ts</code></li><li>Create: <code>libs/contracts/src/topics.ts</code>, <code>events.ts</code>, <code>envelope.ts</code>, <code>parse.ts</code>, <code>index.ts</code></li><li>Modify: <code>.gitignore</code> (already exists: <code>node_modules/ dist/ coverage/ .env</code>)</li><li>Test: <code>libs/contracts/src/parse.spec.ts</code></li></ul>
+<p><strong>Interfaces:</strong></p>
+<ul><li>Produces (import from <code>@app/contracts</code>):</li><li><code>Topics = { OrderEvents: 'order-events', StockEvents: 'stock-events' }</code>, <code>type Topic</code>, <code>dlqTopic(t: Topic): string</code>, <code>ALL_TOPICS: string[]</code></li><li><code>EventTypes = { OrderCreated, OrderPaid, OrderCancelled, StockReserved, StockRejected }</code> (values = the type strings), <code>type EventType</code>, <code>topicFor(type: EventType): Topic</code></li><li><code>interface EventEnvelope { eventId: string; occurredAt: string; orderId: string }</code>, <code>OrderItemLine { productId; quantity }</code>, <code>PricedLine { productId; unitPriceCents }</code>, <code>type RejectionReason</code>, <code>OrderCreated | OrderPaid | OrderCancelled</code> (= <code>OrderEvent</code>), <code>StockReserved | StockRejected</code> (= <code>StockEvent</code>), <code>AnyEvent</code></li><li><code>newEnvelope(orderId: string): EventEnvelope</code></li><li><code>class ContractError extends Error</code>, <code>isUuid(v: unknown): v is string</code>, <code>parseEvent(topic: string, raw: string | null): AnyEvent</code></li></ul>
+<ul><li>[ ] <strong>Step 0: Check Docker and Node</strong></li></ul>
+<p>Run: <code>docker info --format '{{.ServerVersion}}' &amp;&amp; node -v</code> Expected: a Docker server version and <code>v22</code> or newer. If <code>docker</code> is missing, stop and ask the user to install Docker Desktop (or OrbStack) and start it. Do not continue without it.</p>
+<ul><li>[ ] <strong>Step 1: Create <code>package.json</code> and install dependencies</strong></li></ul>
+<pre><code>{
+  &quot;name&quot;: &quot;orderflow&quot;,
+  &quot;version&quot;: &quot;0.1.0&quot;,
+  &quot;private&quot;: true,
+  &quot;license&quot;: &quot;MIT&quot;,
+  &quot;engines&quot;: { &quot;node&quot;: &quot;&gt;=22&quot; },
+  &quot;scripts&quot;: {
+    &quot;build&quot;: &quot;nest build orders &amp;&amp; nest build inventory&quot;,
+    &quot;start:orders&quot;: &quot;nest start orders --watch&quot;,
+    &quot;start:inventory&quot;: &quot;nest start inventory --watch&quot;,
+    &quot;lint&quot;: &quot;eslint .&quot;,
+    &quot;typecheck&quot;: &quot;tsc -p tsconfig.json --noEmit&quot;,
+    &quot;test:unit&quot;: &quot;jest --selectProjects unit&quot;,
+    &quot;test:int&quot;: &quot;jest --selectProjects int --runInBand&quot;,
+    &quot;test:e2e&quot;: &quot;jest --selectProjects e2e --runInBand&quot;,
+    &quot;test&quot;: &quot;npm run test:unit &amp;&amp; npm run test:int &amp;&amp; npm run test:e2e&quot;
+  }
+}</code></pre>
+<p>Run:</p>
+<pre><code>cd ~/Documents/GitHub/orderflow
+npm install @nestjs/common @nestjs/core @nestjs/platform-express @nestjs/graphql @nestjs/apollo @apollo/server graphql @nestjs/typeorm typeorm pg kafkajs reflect-metadata rxjs
+npm install -D @nestjs/cli @nestjs/schematics @nestjs/testing typescript@~5.9 ts-jest jest @types/jest @types/node @types/pg supertest @types/supertest testcontainers @testcontainers/postgresql @testcontainers/kafka eslint typescript-eslint prettier ts-node</code></pre>
+<p>Expected: installs without peer-dependency errors. If npm reports a peer conflict between NestJS packages, install the versions npm names in the error, all at the same major.</p>
+<ul><li>[ ] <strong>Step 2: Write the TypeScript, Nest CLI, Jest, ESLint and Prettier config</strong></li></ul>
+<p><code>tsconfig.json</code>:</p>
+<pre><code>{
+  &quot;compilerOptions&quot;: {
+    &quot;module&quot;: &quot;commonjs&quot;,
+    &quot;target&quot;: &quot;ES2022&quot;,
+    &quot;lib&quot;: [&quot;ES2022&quot;],
+    &quot;strict&quot;: true,
+    &quot;emitDecoratorMetadata&quot;: true,
+    &quot;experimentalDecorators&quot;: true,
+    &quot;esModuleInterop&quot;: true,
+    &quot;skipLibCheck&quot;: true,
+    &quot;forceConsistentCasingInFileNames&quot;: true,
+    &quot;resolveJsonModule&quot;: true,
+    &quot;sourceMap&quot;: true,
+    &quot;outDir&quot;: &quot;./dist&quot;,
+    &quot;baseUrl&quot;: &quot;./&quot;,
+    &quot;types&quot;: [&quot;node&quot;, &quot;jest&quot;],
+    &quot;paths&quot;: {
+      &quot;@app/contracts&quot;: [&quot;libs/contracts/src&quot;],
+      &quot;@app/contracts/*&quot;: [&quot;libs/contracts/src/*&quot;],
+      &quot;@app/messaging&quot;: [&quot;libs/messaging/src&quot;],
+      &quot;@app/messaging/*&quot;: [&quot;libs/messaging/src/*&quot;]
+    }
+  },
+  &quot;include&quot;: [&quot;apps/**/*.ts&quot;, &quot;libs/**/*.ts&quot;, &quot;test/**/*.ts&quot;]
+}</code></pre>
+<p><code>apps/orders/tsconfig.app.json</code> (and the same for <code>apps/inventory</code>, with <code>inventory</code> in <code>outDir</code>):</p>
+<pre><code>{
+  &quot;extends&quot;: &quot;../../tsconfig.json&quot;,
+  &quot;compilerOptions&quot;: { &quot;outDir&quot;: &quot;../../dist/apps/orders&quot; },
+  &quot;include&quot;: [&quot;src/**/*&quot;, &quot;../../libs/**/*&quot;],
+  &quot;exclude&quot;: [&quot;node_modules&quot;, &quot;dist&quot;, &quot;**/*.spec.ts&quot;]
+}</code></pre>
+<p><code>libs/contracts/tsconfig.lib.json</code> (and the same for <code>libs/messaging</code>):</p>
+<pre><code>{
+  &quot;extends&quot;: &quot;../../tsconfig.json&quot;,
+  &quot;compilerOptions&quot;: { &quot;declaration&quot;: true, &quot;outDir&quot;: &quot;../../dist/libs/contracts&quot; },
+  &quot;include&quot;: [&quot;src/**/*&quot;],
+  &quot;exclude&quot;: [&quot;node_modules&quot;, &quot;dist&quot;, &quot;**/*.spec.ts&quot;]
+}</code></pre>
+<p><code>nest-cli.json</code>:</p>
+<pre><code>{
+  &quot;$schema&quot;: &quot;https://json.schemastore.org/nest-cli&quot;,
+  &quot;collection&quot;: &quot;@nestjs/schematics&quot;,
+  &quot;monorepo&quot;: true,
+  &quot;root&quot;: &quot;apps/orders&quot;,
+  &quot;sourceRoot&quot;: &quot;apps/orders/src&quot;,
+  &quot;compilerOptions&quot;: { &quot;webpack&quot;: true, &quot;tsConfigPath&quot;: &quot;apps/orders/tsconfig.app.json&quot; },
+  &quot;projects&quot;: {
+    &quot;orders&quot;: { &quot;type&quot;: &quot;application&quot;, &quot;root&quot;: &quot;apps/orders&quot;, &quot;entryFile&quot;: &quot;main&quot;, &quot;sourceRoot&quot;: &quot;apps/orders/src&quot;, &quot;compilerOptions&quot;: { &quot;tsConfigPath&quot;: &quot;apps/orders/tsconfig.app.json&quot; } },
+    &quot;inventory&quot;: { &quot;type&quot;: &quot;application&quot;, &quot;root&quot;: &quot;apps/inventory&quot;, &quot;entryFile&quot;: &quot;main&quot;, &quot;sourceRoot&quot;: &quot;apps/inventory/src&quot;, &quot;compilerOptions&quot;: { &quot;tsConfigPath&quot;: &quot;apps/inventory/tsconfig.app.json&quot; } },
+    &quot;contracts&quot;: { &quot;type&quot;: &quot;library&quot;, &quot;root&quot;: &quot;libs/contracts&quot;, &quot;entryFile&quot;: &quot;index&quot;, &quot;sourceRoot&quot;: &quot;libs/contracts/src&quot;, &quot;compilerOptions&quot;: { &quot;tsConfigPath&quot;: &quot;libs/contracts/tsconfig.lib.json&quot; } },
+    &quot;messaging&quot;: { &quot;type&quot;: &quot;library&quot;, &quot;root&quot;: &quot;libs/messaging&quot;, &quot;entryFile&quot;: &quot;index&quot;, &quot;sourceRoot&quot;: &quot;libs/messaging/src&quot;, &quot;compilerOptions&quot;: { &quot;tsConfigPath&quot;: &quot;libs/messaging/tsconfig.lib.json&quot; } }
+  }
+}</code></pre>
+<p><code>jest.config.js</code>:</p>
+<pre><code>const base = {
+  rootDir: &#x27;.&#x27;,
+  moduleFileExtensions: [&#x27;js&#x27;, &#x27;json&#x27;, &#x27;ts&#x27;],
+  transform: { &#x27;^.+\\.ts$&#x27;: &#x27;ts-jest&#x27; },
+  testEnvironment: &#x27;node&#x27;,
+  moduleNameMapper: {
+    &#x27;^@app/contracts$&#x27;: &#x27;&lt;rootDir&gt;/libs/contracts/src&#x27;,
+    &#x27;^@app/contracts/(.*)$&#x27;: &#x27;&lt;rootDir&gt;/libs/contracts/src/$1&#x27;,
+    &#x27;^@app/messaging$&#x27;: &#x27;&lt;rootDir&gt;/libs/messaging/src&#x27;,
+    &#x27;^@app/messaging/(.*)$&#x27;: &#x27;&lt;rootDir&gt;/libs/messaging/src/$1&#x27;,
+  },
+};
+
+module.exports = {
+  coverageDirectory: &#x27;coverage&#x27;,
+  collectCoverageFrom: [&#x27;apps/**/src/**/*.ts&#x27;, &#x27;libs/**/src/**/*.ts&#x27;, &#x27;!**/main.ts&#x27;, &#x27;!**/migrations/**&#x27;],
+  projects: [
+    { ...base, displayName: &#x27;unit&#x27;, testMatch: [&#x27;&lt;rootDir&gt;/{apps,libs}/**/*.spec.ts&#x27;] },
+    { ...base, displayName: &#x27;int&#x27;, testMatch: [&#x27;&lt;rootDir&gt;/test/int/**/*.int-spec.ts&#x27;], setupFilesAfterEnv: [&#x27;&lt;rootDir&gt;/test/support/timeout.ts&#x27;] },
+    { ...base, displayName: &#x27;e2e&#x27;, testMatch: [&#x27;&lt;rootDir&gt;/test/e2e/**/*.e2e-spec.ts&#x27;], setupFilesAfterEnv: [&#x27;&lt;rootDir&gt;/test/support/timeout.ts&#x27;] },
+  ],
+};</code></pre>
+<p><code>test/support/timeout.ts</code>:</p>
+<pre><code>// Containers take a while to pull and start on a cold machine or CI runner.
+jest.setTimeout(180_000);</code></pre>
+<p><code>eslint.config.mjs</code>:</p>
+<pre><code>import tseslint from &#x27;typescript-eslint&#x27;;
+
+export default tseslint.config(
+  { ignores: [&#x27;dist/**&#x27;, &#x27;coverage/**&#x27;, &#x27;node_modules/**&#x27;, &#x27;jest.config.js&#x27;] },
+  ...tseslint.configs.recommended,
+  { rules: { &#x27;@typescript-eslint/no-explicit-any&#x27;: &#x27;error&#x27; } },
+);</code></pre>
+<p><code>.prettierrc</code>:</p>
+<pre><code>{ &quot;singleQuote&quot;: true, &quot;trailingComma&quot;: &quot;all&quot;, &quot;printWidth&quot;: 110 }</code></pre>
+<ul><li>[ ] <strong>Step 3: Write the failing contract tests</strong></li></ul>
+<p><code>libs/contracts/src/parse.spec.ts</code>:</p>
+<pre><code>import { ContractError, EventTypes, parseEvent, Topics } from &#x27;./index&#x27;;
+
+const env = {
+  eventId: &#x27;0b8c1f9e-3b7a-4c55-9d0e-1a2b3c4d5e6f&#x27;,
+  occurredAt: &#x27;2026-10-07T10:00:00.000Z&#x27;,
+  orderId: &#x27;9f1e2d3c-4b5a-4c69-8d7e-6f5a4b3c2d1e&#x27;,
+};
+const KEYBOARD = &#x27;11111111-1111-4111-8111-111111111111&#x27;;
+const raw = (v: unknown) =&gt; JSON.stringify(v);
+
+describe(&#x27;parseEvent&#x27;, () =&gt; {
+  it(&#x27;accepts a valid order.created on order-events&#x27;, () =&gt; {
+    const e = parseEvent(
+      Topics.OrderEvents,
+      raw({ ...env, type: EventTypes.OrderCreated, items: [{ productId: KEYBOARD, quantity: 2 }] }),
+    );
+    expect(e).toMatchObject({ type: &#x27;order.created&#x27;, orderId: env.orderId });
+  });
+
+  it(&#x27;accepts a valid stock.rejected on stock-events&#x27;, () =&gt; {
+    const e = parseEvent(Topics.StockEvents, raw({ ...env, type: EventTypes.StockRejected, reason: &#x27;INSUFFICIENT_STOCK&#x27; }));
+    expect(e.type).toBe(&#x27;stock.rejected&#x27;);
+  });
+
+  it.each([
+    [&#x27;null&#x27;, null],
+    [&#x27;not JSON&#x27;, &#x27;not json&#x27;],
+    [&#x27;a JSON array&#x27;, &#x27;[]&#x27;],
+  ])(&#x27;rejects %s&#x27;, (_label, value) =&gt; {
+    expect(() =&gt; parseEvent(Topics.OrderEvents, value)).toThrow(ContractError);
+  });
+
+  it(&#x27;rejects an event on the wrong topic&#x27;, () =&gt; {
+    const value = raw({ ...env, type: EventTypes.StockReserved, lines: [] });
+    expect(() =&gt; parseEvent(Topics.OrderEvents, value)).toThrow(/topic/);
+  });
+
+  it(&#x27;rejects an unknown type&#x27;, () =&gt; {
+    expect(() =&gt; parseEvent(Topics.OrderEvents, raw({ ...env, type: &#x27;order.exploded&#x27; }))).toThrow(ContractError);
+  });
+
+  it.each([
+    [&#x27;empty items&#x27;, []],
+    [&#x27;zero quantity&#x27;, [{ productId: KEYBOARD, quantity: 0 }]],
+    [&#x27;fractional quantity&#x27;, [{ productId: KEYBOARD, quantity: 1.5 }]],
+    [&#x27;non-UUID productId&#x27;, [{ productId: &#x27;abc&#x27;, quantity: 1 }]],
+  ])(&#x27;rejects order.created with %s&#x27;, (_label, items) =&gt; {
+    expect(() =&gt; parseEvent(Topics.OrderEvents, raw({ ...env, type: EventTypes.OrderCreated, items }))).toThrow(ContractError);
+  });
+
+  it(&#x27;rejects a bad envelope&#x27;, () =&gt; {
+    const value = raw({ ...env, eventId: &#x27;nope&#x27;, type: EventTypes.OrderCancelled });
+    expect(() =&gt; parseEvent(Topics.OrderEvents, value)).toThrow(/eventId/);
+  });
+
+  it(&#x27;rejects an unknown rejection reason&#x27;, () =&gt; {
+    const value = raw({ ...env, type: EventTypes.StockRejected, reason: &#x27;BORED&#x27; });
+    expect(() =&gt; parseEvent(Topics.StockEvents, value)).toThrow(/reason/);
+  });
+});</code></pre>
+<ul><li>[ ] <strong>Step 4: Run it to verify it fails</strong></li></ul>
+<p>Run: <code>npx jest --selectProjects unit libs/contracts</code> Expected: FAIL, <code>Cannot find module './index'</code>.</p>
+<ul><li>[ ] <strong>Step 5: Implement <code>libs/contracts</code></strong></li></ul>
+<p><code>libs/contracts/src/topics.ts</code>:</p>
+<pre><code>export const Topics = { OrderEvents: &#x27;order-events&#x27;, StockEvents: &#x27;stock-events&#x27; } as const;
+export type Topic = (typeof Topics)[keyof typeof Topics];
+
+export const EventTypes = {
+  OrderCreated: &#x27;order.created&#x27;,
+  OrderPaid: &#x27;order.paid&#x27;,
+  OrderCancelled: &#x27;order.cancelled&#x27;,
+  StockReserved: &#x27;stock.reserved&#x27;,
+  StockRejected: &#x27;stock.rejected&#x27;,
+} as const;
+export type EventType = (typeof EventTypes)[keyof typeof EventTypes];
+
+export const dlqTopic = (topic: Topic): string =&gt; `${topic}.dlq`;
+
+/** One topic per stream: every event for one order shares a topic, so Kafka keeps them in order. */
+export const topicFor = (type: EventType): Topic =&gt; (type.startsWith(&#x27;order.&#x27;) ? Topics.OrderEvents : Topics.StockEvents);
+
+export const ALL_TOPICS: string[] = [
+  Topics.OrderEvents,
+  Topics.StockEvents,
+  dlqTopic(Topics.OrderEvents),
+  dlqTopic(Topics.StockEvents),
+];</code></pre>
+<p><code>libs/contracts/src/events.ts</code>:</p>
+<pre><code>import { EventTypes } from &#x27;./topics&#x27;;
+
+export interface EventEnvelope {
+  eventId: string;
+  occurredAt: string;
+  orderId: string;
+}
+
+export interface OrderItemLine {
+  productId: string;
+  quantity: number;
+}
+
+export interface PricedLine {
+  productId: string;
+  unitPriceCents: number;
+}
+
+export type RejectionReason = &#x27;INSUFFICIENT_STOCK&#x27; | &#x27;UNKNOWN_PRODUCT&#x27;;
+export const REJECTION_REASONS: readonly RejectionReason[] = [&#x27;INSUFFICIENT_STOCK&#x27;, &#x27;UNKNOWN_PRODUCT&#x27;];
+
+export interface OrderCreated extends EventEnvelope {
+  type: typeof EventTypes.OrderCreated;
+  items: OrderItemLine[];
+}
+export interface OrderPaid extends EventEnvelope {
+  type: typeof EventTypes.OrderPaid;
+  totalCents: number;
+}
+export interface OrderCancelled extends EventEnvelope {
+  type: typeof EventTypes.OrderCancelled;
+}
+export interface StockReserved extends EventEnvelope {
+  type: typeof EventTypes.StockReserved;
+  lines: PricedLine[];
+}
+export interface StockRejected extends EventEnvelope {
+  type: typeof EventTypes.StockRejected;
+  reason: RejectionReason;
+}
+
+export type OrderEvent = OrderCreated | OrderPaid | OrderCancelled;
+export type StockEvent = StockReserved | StockRejected;
+export type AnyEvent = OrderEvent | StockEvent;</code></pre>
+<p><code>libs/contracts/src/envelope.ts</code>:</p>
+<pre><code>import { randomUUID } from &#x27;node:crypto&#x27;;
+import type { EventEnvelope } from &#x27;./events&#x27;;
+
+export function newEnvelope(orderId: string): EventEnvelope {
+  return { eventId: randomUUID(), occurredAt: new Date().toISOString(), orderId };
+}</code></pre>
+<p><code>libs/contracts/src/parse.ts</code>:</p>
+<pre><code>import { AnyEvent, REJECTION_REASONS } from &#x27;./events&#x27;;
+import { EventType, EventTypes, topicFor } from &#x27;./topics&#x27;;
+
+export class ContractError extends Error {}
+
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+export const isUuid = (v: unknown): v is string =&gt; typeof v === &#x27;string&#x27; &amp;&amp; UUID.test(v);
+
+type Obj = Record&lt;string, unknown&gt;;
+const isObj = (v: unknown): v is Obj =&gt; typeof v === &#x27;object&#x27; &amp;&amp; v !== null &amp;&amp; !Array.isArray(v);
+const KNOWN_TYPES = new Set&lt;string&gt;(Object.values(EventTypes));
+
+function uuidField(o: Obj, field: string): void {
+  if (!isUuid(o[field])) throw new ContractError(`${field} must be a UUID`);
+}
+function intField(o: Obj, field: string, min: number): void {
+  const v = o[field];
+  if (typeof v !== &#x27;number&#x27; || !Number.isInteger(v) || v &lt; min) {
+    throw new ContractError(`${field} must be an integer &gt;= ${min}`);
+  }
+}
+function lines(v: unknown, field: string, check: (line: Obj) =&gt; void): void {
+  if (!Array.isArray(v) || v.length === 0) throw new ContractError(`${field} must be a non-empty array`);
+  for (const line of v) {
+    if (!isObj(line)) throw new ContractError(`${field} entries must be objects`);
+    check(line);
+  }
+}
+
+/** Validates a raw Kafka message value against the contract for the topic it arrived on. */
+export function parseEvent(topic: string, raw: string | null): AnyEvent {
+  if (raw === null) throw new ContractError(&#x27;empty message&#x27;);
+  let v: unknown;
+  try {
+    v = JSON.parse(raw);
+  } catch {
+    throw new ContractError(&#x27;message is not JSON&#x27;);
+  }
+  if (!isObj(v)) throw new ContractError(&#x27;message is not a JSON object&#x27;);
+  if (typeof v.type !== &#x27;string&#x27; || !KNOWN_TYPES.has(v.type)) throw new ContractError(`unknown type ${String(v.type)}`);
+  const type = v.type as EventType;
+  if (topicFor(type) !== topic) throw new ContractError(`type ${type} does not belong on topic ${topic}`);
+  uuidField(v, &#x27;eventId&#x27;);
+  uuidField(v, &#x27;orderId&#x27;);
+  if (typeof v.occurredAt !== &#x27;string&#x27; || Number.isNaN(Date.parse(v.occurredAt))) {
+    throw new ContractError(&#x27;occurredAt must be an ISO date&#x27;);
+  }
+
+  switch (type) {
+    case EventTypes.OrderCreated:
+      lines(v.items, &#x27;items&#x27;, (l) =&gt; {
+        uuidField(l, &#x27;productId&#x27;);
+        intField(l, &#x27;quantity&#x27;, 1);
+      });
+      break;
+    case EventTypes.OrderPaid:
+      intField(v, &#x27;totalCents&#x27;, 0);
+      break;
+    case EventTypes.StockReserved:
+      lines(v.lines, &#x27;lines&#x27;, (l) =&gt; {
+        uuidField(l, &#x27;productId&#x27;);
+        intField(l, &#x27;unitPriceCents&#x27;, 0);
+      });
+      break;
+    case EventTypes.StockRejected:
+      if (!REJECTION_REASONS.includes(v.reason as never)) throw new ContractError(`unknown reason ${String(v.reason)}`);
+      break;
+    case EventTypes.OrderCancelled:
+      break;
+  }
+  return v as unknown as AnyEvent;
+}</code></pre>
+<p><code>libs/contracts/src/index.ts</code>:</p>
+<pre><code>export * from &#x27;./topics&#x27;;
+export * from &#x27;./events&#x27;;
+export * from &#x27;./envelope&#x27;;
+export * from &#x27;./parse&#x27;;</code></pre>
+<ul><li>[ ] <strong>Step 6: Run the tests, lint and typecheck</strong></li></ul>
+<p>Run: <code>npx jest --selectProjects unit libs/contracts &amp;&amp; npm run lint &amp;&amp; npm run typecheck</code> Expected: all contract tests PASS; lint and typecheck report no errors.</p>
+<ul><li>[ ] <strong>Step 7: Commit</strong></li></ul>
+<pre><code>git add -A
+git commit -m &quot;chore: scaffold Nest monorepo; feat(contracts): event types and payload validator&quot;</code></pre>
+<hr>
+<h3 id="task-2-libs-messaging-retry-policy-and-the-message-processor">Task 2: <code>libs/messaging</code> — retry policy and the message processor</h3>
+<p><strong>Files:</strong></p>
+<ul><li>Create: <code>libs/messaging/src/logger.ts</code>, <code>retry.ts</code>, <code>consumer.ts</code>, <code>kafka.ts</code>, <code>index.ts</code></li><li>Test: <code>libs/messaging/src/retry.spec.ts</code>, <code>libs/messaging/src/consumer.spec.ts</code></li></ul>
+<p><strong>Interfaces:</strong></p>
+<ul><li>Consumes: <code>parseEvent</code>, <code>ContractError</code>, <code>Topic</code>, <code>dlqTopic</code>, <code>ALL_TOPICS</code>, <code>AnyEvent</code> from <code>@app/contracts</code>.</li><li>Produces (import from <code>@app/messaging</code>):</li><li><code>interface LoggerLike { log(m: string): void; warn(m: string): void; error(m: string): void }</code></li><li><code>MAX_ATTEMPTS = 3</code>, <code>backoffMs(attempt: number, baseMs: number): number</code>, <code>decide(err: unknown, attempt: number): 'retry' | 'dlq'</code>, <code>errMessage(e: unknown): string</code></li><li><code>interface RawMessage { topic: string; key: string | null; value: string | null }</code></li><li><code>interface DeadLetter { topic: string; key: string | null; original: string | null; error: string; attempts: number; failedAt: string }</code></li><li><code>processMessage(msg: RawMessage, deps: ProcessDeps): Promise&lt;'handled' | 'dead-lettered'&gt;</code> where <code>ProcessDeps = { handle(e: AnyEvent): Promise&lt;void&gt;; sendToDlq(d: DeadLetter): Promise&lt;void&gt;; sleep(ms: number): Promise&lt;void&gt;; baseBackoffMs: number; logger?: LoggerLike }</code></li><li><code>class EventConsumer { constructor(o: EventConsumerOptions); start(): Promise&lt;void&gt;; stop(): Promise&lt;void&gt; }</code> with <code>EventConsumerOptions = { kafka: Kafka; groupId: string; topic: Topic; handle(e: AnyEvent): Promise&lt;void&gt;; logger?: LoggerLike; baseBackoffMs?: number }</code></li><li><code>createKafka(clientId: string, brokers: string[]): Kafka</code>, <code>ensureTopics(kafka: Kafka, numPartitions?: number): Promise&lt;void&gt;</code></li></ul>
+<ul><li>[ ] <strong>Step 1: Write the failing tests</strong></li></ul>
+<p><code>libs/messaging/src/retry.spec.ts</code>:</p>
+<pre><code>import { ContractError } from &#x27;@app/contracts&#x27;;
+import { backoffMs, decide, MAX_ATTEMPTS } from &#x27;./retry&#x27;;
+
+describe(&#x27;retry policy&#x27;, () =&gt; {
+  it(&#x27;doubles the backoff each attempt&#x27;, () =&gt; {
+    expect([1, 2, 3].map((a) =&gt; backoffMs(a, 200))).toEqual([200, 400, 800]);
+  });
+
+  it(&#x27;retries a handler error until the last attempt, then dead-letters&#x27;, () =&gt; {
+    expect(decide(new Error(&#x27;db down&#x27;), 1)).toBe(&#x27;retry&#x27;);
+    expect(decide(new Error(&#x27;db down&#x27;), MAX_ATTEMPTS - 1)).toBe(&#x27;retry&#x27;);
+    expect(decide(new Error(&#x27;db down&#x27;), MAX_ATTEMPTS)).toBe(&#x27;dlq&#x27;);
+  });
+
+  it(&#x27;dead-letters a contract violation on the first attempt (retrying cannot fix it)&#x27;, () =&gt; {
+    expect(decide(new ContractError(&#x27;bad payload&#x27;), 1)).toBe(&#x27;dlq&#x27;);
+  });
+});</code></pre>
+<p><code>libs/messaging/src/consumer.spec.ts</code>:</p>
+<pre><code>import { EventTypes, Topics } from &#x27;@app/contracts&#x27;;
+import { DeadLetter, processMessage, ProcessDeps } from &#x27;./consumer&#x27;;
+
+const valid = JSON.stringify({
+  type: EventTypes.OrderCancelled,
+  eventId: &#x27;0b8c1f9e-3b7a-4c55-9d0e-1a2b3c4d5e6f&#x27;,
+  occurredAt: &#x27;2026-10-07T10:00:00.000Z&#x27;,
+  orderId: &#x27;9f1e2d3c-4b5a-4c69-8d7e-6f5a4b3c2d1e&#x27;,
+});
+const msg = (value: string | null) =&gt; ({ topic: Topics.OrderEvents, key: &#x27;k&#x27;, value });
+
+function deps(handle: ProcessDeps[&#x27;handle&#x27;]) {
+  const dead: DeadLetter[] = [];
+  const sleeps: number[] = [];
+  const d: ProcessDeps = {
+    handle,
+    sendToDlq: async (x) =&gt; void dead.push(x),
+    sleep: async (ms) =&gt; void sleeps.push(ms),
+    baseBackoffMs: 200,
+  };
+  return { d, dead, sleeps };
+}
+
+describe(&#x27;processMessage&#x27;, () =&gt; {
+  it(&#x27;hands a valid event to the handler once&#x27;, async () =&gt; {
+    const handle = jest.fn().mockResolvedValue(undefined);
+    const { d, dead } = deps(handle);
+    await expect(processMessage(msg(valid), d)).resolves.toBe(&#x27;handled&#x27;);
+    expect(handle).toHaveBeenCalledTimes(1);
+    expect(dead).toHaveLength(0);
+  });
+
+  it(&#x27;retries a transient failure with backoff and then succeeds&#x27;, async () =&gt; {
+    const handle = jest.fn().mockRejectedValueOnce(new Error(&#x27;deadlock&#x27;)).mockResolvedValue(undefined);
+    const { d, dead, sleeps } = deps(handle);
+    await expect(processMessage(msg(valid), d)).resolves.toBe(&#x27;handled&#x27;);
+    expect(handle).toHaveBeenCalledTimes(2);
+    expect(sleeps).toEqual([200]);
+    expect(dead).toHaveLength(0);
+  });
+
+  it(&#x27;dead-letters after 3 failed attempts, keeping the original and the error&#x27;, async () =&gt; {
+    const handle = jest.fn().mockRejectedValue(new Error(&#x27;always broken&#x27;));
+    const { d, dead, sleeps } = deps(handle);
+    await expect(processMessage(msg(valid), d)).resolves.toBe(&#x27;dead-lettered&#x27;);
+    expect(handle).toHaveBeenCalledTimes(3);
+    expect(sleeps).toEqual([200, 400]);
+    expect(dead[0]).toMatchObject({ topic: &#x27;order-events&#x27;, key: &#x27;k&#x27;, original: valid, error: &#x27;always broken&#x27;, attempts: 3 });
+  });
+
+  it(&#x27;dead-letters a malformed message immediately without calling the handler&#x27;, async () =&gt; {
+    const handle = jest.fn();
+    const { d, dead, sleeps } = deps(handle);
+    await expect(processMessage(msg(&#x27;not json&#x27;), d)).resolves.toBe(&#x27;dead-lettered&#x27;);
+    expect(handle).not.toHaveBeenCalled();
+    expect(sleeps).toEqual([]);
+    expect(dead[0]).toMatchObject({ original: &#x27;not json&#x27;, attempts: 1 });
+  });
+});</code></pre>
+<ul><li>[ ] <strong>Step 2: Run them to verify they fail</strong></li></ul>
+<p>Run: <code>npx jest --selectProjects unit libs/messaging</code> Expected: FAIL, <code>Cannot find module './retry'</code> and <code>'./consumer'</code>.</p>
+<ul><li>[ ] <strong>Step 3: Implement</strong></li></ul>
+<p><code>libs/messaging/src/logger.ts</code>:</p>
+<pre><code>/** The subset of Nest&#x27;s Logger the plumbing needs; keeps libs/messaging free of Nest. */
+export interface LoggerLike {
+  log(message: string): void;
+  warn(message: string): void;
+  error(message: string): void;
+}</code></pre>
+<p><code>libs/messaging/src/retry.ts</code>:</p>
+<pre><code>import { ContractError } from &#x27;@app/contracts&#x27;;
+
+export const MAX_ATTEMPTS = 3;
+
+export function backoffMs(attempt: number, baseMs: number): number {
+  return baseMs * 2 ** (attempt - 1);
+}
+
+export function decide(error: unknown, attempt: number): &#x27;retry&#x27; | &#x27;dlq&#x27; {
+  if (error instanceof ContractError) return &#x27;dlq&#x27;;
+  return attempt &lt; MAX_ATTEMPTS ? &#x27;retry&#x27; : &#x27;dlq&#x27;;
+}
+
+export function errMessage(e: unknown): string {
+  return e instanceof Error ? e.message : String(e);
+}</code></pre>
+<p><code>libs/messaging/src/consumer.ts</code>:</p>
+<pre><code>import { AnyEvent, dlqTopic, parseEvent, Topic } from &#x27;@app/contracts&#x27;;
+import { Consumer, Kafka, Producer } from &#x27;kafkajs&#x27;;
+import { LoggerLike } from &#x27;./logger&#x27;;
+import { backoffMs, decide, errMessage } from &#x27;./retry&#x27;;
+
+export interface RawMessage {
+  topic: string;
+  key: string | null;
+  value: string | null;
+}
+
+export interface DeadLetter {
+  topic: string;
+  key: string | null;
+  original: string | null;
+  error: string;
+  attempts: number;
+  failedAt: string;
+}
+
+export interface ProcessDeps {
+  handle(event: AnyEvent): Promise&lt;void&gt;;
+  sendToDlq(letter: DeadLetter): Promise&lt;void&gt;;
+  sleep(ms: number): Promise&lt;void&gt;;
+  baseBackoffMs: number;
+  logger?: LoggerLike;
+}
+
+/** Parse, handle, retry with backoff, and dead-letter what can&#x27;t be handled — so one bad message never blocks a partition. */
+export async function processMessage(msg: RawMessage, deps: ProcessDeps): Promise&lt;&#x27;handled&#x27; | &#x27;dead-lettered&#x27;&gt; {
+  for (let attempt = 1; ; attempt++) {
+    try {
+      await deps.handle(parseEvent(msg.topic, msg.value));
+      return &#x27;handled&#x27;;
+    } catch (err) {
+      if (decide(err, attempt) === &#x27;retry&#x27;) {
+        deps.logger?.warn(`${msg.topic} attempt ${attempt} failed: ${errMessage(err)}; retrying`);
+        await deps.sleep(backoffMs(attempt, deps.baseBackoffMs));
+        continue;
+      }
+      await deps.sendToDlq({
+        topic: msg.topic,
+        key: msg.key,
+        original: msg.value,
+        error: errMessage(err),
+        attempts: attempt,
+        failedAt: new Date().toISOString(),
+      });
+      deps.logger?.error(`${msg.topic} message dead-lettered after ${attempt} attempt(s): ${errMessage(err)}`);
+      return &#x27;dead-lettered&#x27;;
+    }
+  }
+}
+
+export interface EventConsumerOptions {
+  kafka: Kafka;
+  groupId: string;
+  topic: Topic;
+  handle(event: AnyEvent): Promise&lt;void&gt;;
+  logger?: LoggerLike;
+  baseBackoffMs?: number;
+}
+
+const sleep = (ms: number) =&gt; new Promise&lt;void&gt;((resolve) =&gt; setTimeout(resolve, ms));
+
+export class EventConsumer {
+  private readonly consumer: Consumer;
+  private readonly dlqProducer: Producer;
+
+  constructor(private readonly o: EventConsumerOptions) {
+    this.consumer = o.kafka.consumer({ groupId: o.groupId });
+    this.dlqProducer = o.kafka.producer();
+  }
+
+  async start(): Promise&lt;void&gt; {
+    await this.dlqProducer.connect();
+    await this.consumer.connect();
+    await this.consumer.subscribe({ topic: this.o.topic, fromBeginning: true });
+    await this.consumer.run({
+      eachMessage: async ({ message }) =&gt; {
+        await processMessage(
+          { topic: this.o.topic, key: message.key?.toString() ?? null, value: message.value?.toString() ?? null },
+          {
+            handle: this.o.handle,
+            sendToDlq: async (letter) =&gt; {
+              await this.dlqProducer.send({
+                topic: dlqTopic(this.o.topic),
+                messages: [{ key: letter.key, value: JSON.stringify(letter) }],
+              });
+            },
+            sleep,
+            baseBackoffMs: this.o.baseBackoffMs ?? 200,
+            logger: this.o.logger,
+          },
+        );
+      },
+    });
+  }
+
+  async stop(): Promise&lt;void&gt; {
+    await this.consumer.disconnect();
+    await this.dlqProducer.disconnect();
+  }
+}</code></pre>
+<p><code>libs/messaging/src/kafka.ts</code>:</p>
+<pre><code>import { ALL_TOPICS } from &#x27;@app/contracts&#x27;;
+import { Kafka, logLevel } from &#x27;kafkajs&#x27;;
+
+export function createKafka(clientId: string, brokers: string[]): Kafka {
+  return new Kafka({ clientId, brokers, logLevel: logLevel.WARN });
+}
+
+function isAlreadyExists(e: unknown): boolean {
+  const errors = (e as { errors?: { type?: string }[] }).errors;
+  return Array.isArray(errors) &amp;&amp; errors.length &gt; 0 &amp;&amp; errors.every((x) =&gt; x.type === &#x27;TOPIC_ALREADY_EXISTS&#x27;);
+}
+
+/** Idempotent: both services call it on boot, possibly at the same time. */
+export async function ensureTopics(kafka: Kafka, numPartitions = 3): Promise&lt;void&gt; {
+  const admin = kafka.admin();
+  await admin.connect();
+  try {
+    await admin.createTopics({
+      waitForLeaders: true,
+      topics: ALL_TOPICS.map((topic) =&gt; ({ topic, numPartitions, replicationFactor: 1 })),
+    });
+  } catch (e) {
+    if (!isAlreadyExists(e)) throw e;
+  } finally {
+    await admin.disconnect();
+  }
+}</code></pre>
+<p><code>libs/messaging/src/index.ts</code>:</p>
+<pre><code>export * from &#x27;./logger&#x27;;
+export * from &#x27;./retry&#x27;;
+export * from &#x27;./consumer&#x27;;
+export * from &#x27;./kafka&#x27;;</code></pre>
+<ul><li>[ ] <strong>Step 4: Run the tests, lint and typecheck</strong></li></ul>
+<p>Run: <code>npx jest --selectProjects unit libs/messaging &amp;&amp; npm run lint &amp;&amp; npm run typecheck</code> Expected: PASS, no lint or type errors.</p>
+<ul><li>[ ] <strong>Step 5: Commit</strong></li></ul>
+<pre><code>git add -A
+git commit -m &quot;feat(messaging): retry policy, message processor with DLQ, Kafka helpers&quot;</code></pre>
+<hr>
+<h3 id="task-3-orders-domain-rules-pure">Task 3: Orders domain rules (pure)</h3>
+<p><strong>Files:</strong></p>
+<ul><li>Create: <code>apps/orders/src/orders/order-status.ts</code>, <code>order-state.ts</code>, <code>errors.ts</code>, <code>order-input.ts</code>, <code>pagination.ts</code></li><li>Test: <code>apps/orders/src/orders/order-state.spec.ts</code>, <code>order-input.spec.ts</code>, <code>pagination.spec.ts</code></li></ul>
+<p><strong>Interfaces:</strong></p>
+<ul><li>Consumes: <code>isUuid</code>, <code>OrderItemLine</code> from <code>@app/contracts</code>.</li><li>Produces:</li><li><code>enum OrderStatus { PENDING, RESERVED, REJECTED, PAID, CANCELLED }</code> (string values equal to names)</li><li><code>canTransition(from: OrderStatus, to: OrderStatus): boolean</code>, <code>assertTransition(from, to): void</code>, <code>class InvalidStateError extends Error</code></li><li><code>class InvalidInputError extends Error</code>, <code>class OrderNotFoundError extends Error { constructor(id: string) }</code></li><li><code>MAX_LINES = 50</code>, <code>MAX_QUANTITY = 1000</code>, <code>assertUuid(value: string, field: string): void</code>, <code>validateItems(items: OrderItemLine[]): void</code></li><li><code>DEFAULT_PAGE_SIZE = 20</code>, <code>MAX_PAGE_SIZE = 100</code>, <code>pageSize(first?: number | null): number</code>, <code>interface Cursor { createdAt: string; id: string }</code>, <code>encodeCursor(c: { createdAt: Date; id: string }): string</code>, <code>decodeCursor(s: string): Cursor</code></li></ul>
+<ul><li>[ ] <strong>Step 1: Write the failing tests</strong></li></ul>
+<p><code>apps/orders/src/orders/order-state.spec.ts</code>:</p>
+<pre><code>import { assertTransition, canTransition, InvalidStateError } from &#x27;./order-state&#x27;;
+import { OrderStatus as S } from &#x27;./order-status&#x27;;
+
+describe(&#x27;order state machine&#x27;, () =&gt; {
+  it.each([
+    [S.PENDING, S.RESERVED],
+    [S.PENDING, S.REJECTED],
+    [S.PENDING, S.CANCELLED],
+    [S.RESERVED, S.PAID],
+    [S.RESERVED, S.CANCELLED],
+  ])(&#x27;allows %s -&gt; %s&#x27;, (from, to) =&gt; {
+    expect(canTransition(from, to)).toBe(true);
+  });
+
+  it.each([
+    [S.PENDING, S.PAID],
+    [S.REJECTED, S.PAID],
+    [S.REJECTED, S.CANCELLED],
+    [S.PAID, S.CANCELLED],
+    [S.CANCELLED, S.CANCELLED],
+    [S.PAID, S.PAID],
+    [S.RESERVED, S.RESERVED],
+  ])(&#x27;refuses %s -&gt; %s&#x27;, (from, to) =&gt; {
+    expect(canTransition(from, to)).toBe(false);
+    expect(() =&gt; assertTransition(from, to)).toThrow(InvalidStateError);
+  });
+});</code></pre>
+<p><code>apps/orders/src/orders/order-input.spec.ts</code>:</p>
+<pre><code>import { InvalidInputError } from &#x27;./errors&#x27;;
+import { MAX_LINES, validateItems } from &#x27;./order-input&#x27;;
+
+const P1 = &#x27;11111111-1111-4111-8111-111111111111&#x27;;
+const P2 = &#x27;22222222-2222-4222-8222-222222222222&#x27;;
+
+describe(&#x27;validateItems&#x27;, () =&gt; {
+  it(&#x27;accepts a normal order&#x27;, () =&gt; {
+    expect(() =&gt; validateItems([{ productId: P1, quantity: 2 }, { productId: P2, quantity: 1 }])).not.toThrow();
+  });
+
+  it.each([
+    [&#x27;no items&#x27;, []],
+    [&#x27;quantity 0&#x27;, [{ productId: P1, quantity: 0 }]],
+    [&#x27;negative quantity&#x27;, [{ productId: P1, quantity: -1 }]],
+    [&#x27;quantity over 1000&#x27;, [{ productId: P1, quantity: 1001 }]],
+    [&#x27;fractional quantity&#x27;, [{ productId: P1, quantity: 1.5 }]],
+    [&#x27;a non-UUID productId&#x27;, [{ productId: &#x27;keyboard&#x27;, quantity: 1 }]],
+    [&#x27;the same product twice&#x27;, [{ productId: P1, quantity: 1 }, { productId: P1, quantity: 2 }]],
+    [&#x27;too many lines&#x27;, Array.from({ length: MAX_LINES + 1 }, (_, i) =&gt; ({ productId: `${String(i).padStart(8, &#x27;0&#x27;)}-1111-4111-8111-111111111111`, quantity: 1 }))],
+  ])(&#x27;rejects %s&#x27;, (_label, items) =&gt; {
+    expect(() =&gt; validateItems(items)).toThrow(InvalidInputError);
+  });
+});</code></pre>
+<p><code>apps/orders/src/orders/pagination.spec.ts</code>:</p>
+<pre><code>import { InvalidInputError } from &#x27;./errors&#x27;;
+import { decodeCursor, encodeCursor, MAX_PAGE_SIZE, pageSize } from &#x27;./pagination&#x27;;
+
+describe(&#x27;pagination&#x27;, () =&gt; {
+  it(&#x27;defaults to 20 and caps at 100&#x27;, () =&gt; {
+    expect(pageSize(undefined)).toBe(20);
+    expect(pageSize(null)).toBe(20);
+    expect(pageSize(5)).toBe(5);
+    expect(pageSize(1000)).toBe(MAX_PAGE_SIZE);
+  });
+
+  it(&#x27;rejects a page size below 1&#x27;, () =&gt; {
+    expect(() =&gt; pageSize(0)).toThrow(InvalidInputError);
+  });
+
+  it(&#x27;round-trips a cursor&#x27;, () =&gt; {
+    const c = encodeCursor({ createdAt: new Date(&#x27;2026-10-07T10:00:00.123Z&#x27;), id: &#x27;11111111-1111-4111-8111-111111111111&#x27; });
+    expect(decodeCursor(c)).toEqual({ createdAt: &#x27;2026-10-07T10:00:00.123Z&#x27;, id: &#x27;11111111-1111-4111-8111-111111111111&#x27; });
+  });
+
+  it.each([&#x27;garbage&#x27;, Buffer.from(&#x27;no-separator&#x27;).toString(&#x27;base64url&#x27;), Buffer.from(&#x27;not-a-date|abc&#x27;).toString(&#x27;base64url&#x27;)])(
+    &#x27;rejects a malformed cursor %s&#x27;,
+    (c) =&gt; {
+      expect(() =&gt; decodeCursor(c)).toThrow(InvalidInputError);
+    },
+  );
+});</code></pre>
+<ul><li>[ ] <strong>Step 2: Run them to verify they fail</strong></li></ul>
+<p>Run: <code>npx jest --selectProjects unit apps/orders</code> Expected: FAIL, modules not found.</p>
+<ul><li>[ ] <strong>Step 3: Implement</strong></li></ul>
+<p><code>apps/orders/src/orders/order-status.ts</code>:</p>
+<pre><code>export enum OrderStatus {
+  PENDING = &#x27;PENDING&#x27;,
+  RESERVED = &#x27;RESERVED&#x27;,
+  REJECTED = &#x27;REJECTED&#x27;,
+  PAID = &#x27;PAID&#x27;,
+  CANCELLED = &#x27;CANCELLED&#x27;,
+}</code></pre>
+<p><code>apps/orders/src/orders/order-state.ts</code>:</p>
+<pre><code>import { OrderStatus as S } from &#x27;./order-status&#x27;;
+
+const ALLOWED: Record&lt;S, readonly S[]&gt; = {
+  [S.PENDING]: [S.RESERVED, S.REJECTED, S.CANCELLED],
+  [S.RESERVED]: [S.PAID, S.CANCELLED],
+  [S.REJECTED]: [],
+  [S.PAID]: [],
+  [S.CANCELLED]: [],
+};
+
+export class InvalidStateError extends Error {
+  constructor(
+    readonly from: S,
+    readonly to: S,
+  ) {
+    super(`Cannot move an order from ${from} to ${to}`);
+  }
+}
+
+export const canTransition = (from: S, to: S): boolean =&gt; ALLOWED[from].includes(to);
+
+export function assertTransition(from: S, to: S): void {
+  if (!canTransition(from, to)) throw new InvalidStateError(from, to);
+}</code></pre>
+<p><code>apps/orders/src/orders/errors.ts</code>:</p>
+<pre><code>export class InvalidInputError extends Error {}
+
+export class OrderNotFoundError extends Error {
+  constructor(id: string) {
+    super(`Order ${id} not found`);
+  }
+}</code></pre>
+<p><code>apps/orders/src/orders/order-input.ts</code>:</p>
+<pre><code>import { isUuid, OrderItemLine } from &#x27;@app/contracts&#x27;;
+import { InvalidInputError } from &#x27;./errors&#x27;;
+
+export const MAX_LINES = 50;
+export const MAX_QUANTITY = 1000;
+
+export function assertUuid(value: string, field: string): void {
+  if (!isUuid(value)) throw new InvalidInputError(`${field} must be a UUID`);
+}
+
+export function validateItems(items: OrderItemLine[]): void {
+  if (items.length === 0) throw new InvalidInputError(&#x27;An order needs at least one item&#x27;);
+  if (items.length &gt; MAX_LINES) throw new InvalidInputError(`An order can have at most ${MAX_LINES} lines`);
+  const seen = new Set&lt;string&gt;();
+  for (const item of items) {
+    assertUuid(item.productId, &#x27;productId&#x27;);
+    if (!Number.isInteger(item.quantity) || item.quantity &lt; 1 || item.quantity &gt; MAX_QUANTITY) {
+      throw new InvalidInputError(`quantity must be an integer from 1 to ${MAX_QUANTITY}`);
+    }
+    if (seen.has(item.productId)) {
+      throw new InvalidInputError(`productId ${item.productId} appears twice; combine the quantities`);
+    }
+    seen.add(item.productId);
+  }
+}</code></pre>
+<p><code>apps/orders/src/orders/pagination.ts</code>:</p>
+<pre><code>import { isUuid } from &#x27;@app/contracts&#x27;;
+import { InvalidInputError } from &#x27;./errors&#x27;;
+
+export const DEFAULT_PAGE_SIZE = 20;
+export const MAX_PAGE_SIZE = 100;
+
+export interface Cursor {
+  createdAt: string;
+  id: string;
+}
+
+export function pageSize(first?: number | null): number {
+  if (first === undefined || first === null) return DEFAULT_PAGE_SIZE;
+  if (first &lt; 1) throw new InvalidInputError(&#x27;first must be at least 1&#x27;);
+  return Math.min(first, MAX_PAGE_SIZE);
+}
+
+export function encodeCursor(row: { createdAt: Date; id: string }): string {
+  return Buffer.from(`${row.createdAt.toISOString()}|${row.id}`).toString(&#x27;base64url&#x27;);
+}
+
+export function decodeCursor(cursor: string): Cursor {
+  const [createdAt, id, ...rest] = Buffer.from(cursor, &#x27;base64url&#x27;).toString(&#x27;utf8&#x27;).split(&#x27;|&#x27;);
+  if (rest.length &gt; 0 || !createdAt || Number.isNaN(Date.parse(createdAt)) || !isUuid(id)) {
+    throw new InvalidInputError(&#x27;after is not a valid cursor&#x27;);
+  }
+  return { createdAt, id };
+}</code></pre>
+<ul><li>[ ] <strong>Step 4: Run the tests</strong></li></ul>
+<p>Run: <code>npx jest --selectProjects unit apps/orders &amp;&amp; npm run lint &amp;&amp; npm run typecheck</code> Expected: PASS.</p>
+<ul><li>[ ] <strong>Step 5: Commit</strong></li></ul>
+<pre><code>git add -A
+git commit -m &quot;feat(orders): state machine, input validation and cursor pagination&quot;</code></pre>
+<hr>
+<h3 id="task-4-libs-messaging-outbox-and-idempotency-guard-against-real-postgresql">Task 4: <code>libs/messaging</code> — outbox and idempotency guard (against real PostgreSQL)</h3>
+<p><strong>Files:</strong></p>
+<ul><li>Create: <code>libs/messaging/src/schema.ts</code>, <code>idempotency.ts</code>, <code>outbox.ts</code>; modify <code>libs/messaging/src/index.ts</code></li><li>Create: <code>test/support/postgres.ts</code>, <code>test/support/fake-producer.ts</code></li><li>Test: <code>test/int/messaging.int-spec.ts</code></li></ul>
+<p><strong>Interfaces:</strong></p>
+<ul><li>Consumes: <code>AnyEvent</code>, <code>topicFor</code> from <code>@app/contracts</code>; <code>LoggerLike</code>, <code>errMessage</code> from Task 2.</li><li>Produces (from <code>@app/messaging</code>):</li><li><code>MESSAGING_TABLES_SQL: string</code>, <code>DROP_MESSAGING_TABLES_SQL: string</code> (both apps' migrations run these)</li><li><code>class ProcessedEvent</code> entity (<code>processed_events</code>), <code>markProcessed(m: EntityManager, eventId: string): Promise&lt;boolean&gt;</code> (true = first time)</li><li><code>class OutboxMessage</code> entity (<code>outbox</code>: <code>seq</code>, <code>eventId</code>, <code>topic</code>, <code>key</code>, <code>payload</code>, <code>createdAt</code>, <code>sentAt</code>)</li><li><code>enqueue(m: EntityManager, event: AnyEvent): Promise&lt;void&gt;</code></li><li><code>type ProducerLike = Pick&lt;Producer, 'connect' | 'disconnect' | 'sendBatch'&gt;</code></li><li><code>class OutboxPublisher { constructor(ds: DataSource, producer: ProducerLike, o: { intervalMs: number; batchSize?: number; logger?: LoggerLike }); start(): Promise&lt;void&gt;; stop(): Promise&lt;void&gt;; publishBatch(): Promise&lt;number&gt; }</code></li><li>test support: <code>startPostgres(): Promise&lt;{ container: StartedPostgreSqlContainer; ordersUrl: string; inventoryUrl: string }&gt;</code>, <code>class FakeProducer implements ProducerLike { sent: { topic: string; key: string; value: string }[]; failNext: number }</code></li></ul>
+<ul><li>[ ] <strong>Step 1: Write the test support files</strong></li></ul>
+<p><code>test/support/postgres.ts</code>:</p>
+<pre><code>import { PostgreSqlContainer, StartedPostgreSqlContainer } from &#x27;@testcontainers/postgresql&#x27;;
+import { Client } from &#x27;pg&#x27;;
+
+/** One PostgreSQL container holding both service databases, like docker-compose does. */
+export async function startPostgres(): Promise&lt;{
+  container: StartedPostgreSqlContainer;
+  ordersUrl: string;
+  inventoryUrl: string;
+}&gt; {
+  const container = await new PostgreSqlContainer(&#x27;postgres:16-alpine&#x27;)
+    .withDatabase(&#x27;orders&#x27;)
+    .withUsername(&#x27;orderflow&#x27;)
+    .withPassword(&#x27;orderflow&#x27;)
+    .start();
+  const base = `postgres://orderflow:orderflow@${container.getHost()}:${container.getMappedPort(5432)}`;
+  const admin = new Client({ connectionString: `${base}/orders` });
+  await admin.connect();
+  await admin.query(&#x27;CREATE DATABASE inventory&#x27;);
+  await admin.end();
+  return { container, ordersUrl: `${base}/orders`, inventoryUrl: `${base}/inventory` };
+}</code></pre>
+<p><code>test/support/fake-producer.ts</code>:</p>
+<pre><code>import { ProducerLike } from &#x27;@app/messaging&#x27;;
+
+type SendBatchArgs = Parameters&lt;ProducerLike[&#x27;sendBatch&#x27;]&gt;[0];
+
+/** Records what would have gone to Kafka; `failNext` makes the next N sends throw like a broker outage. */
+export class FakeProducer implements ProducerLike {
+  sent: { topic: string; key: string; value: string }[] = [];
+  failNext = 0;
+
+  async connect(): Promise&lt;void&gt; {}
+  async disconnect(): Promise&lt;void&gt; {}
+
+  async sendBatch(batch: SendBatchArgs) {
+    if (this.failNext &gt; 0) {
+      this.failNext--;
+      throw new Error(&#x27;broker unavailable&#x27;);
+    }
+    for (const tm of batch.topicMessages ?? []) {
+      for (const m of tm.messages) this.sent.push({ topic: tm.topic, key: String(m.key), value: String(m.value) });
+    }
+    return [];
+  }
+}</code></pre>
+<ul><li>[ ] <strong>Step 2: Write the failing integration test</strong></li></ul>
+<p><code>test/int/messaging.int-spec.ts</code>:</p>
+<pre><code>import { EventTypes, newEnvelope, OrderCancelled } from &#x27;@app/contracts&#x27;;
+import {
+  enqueue,
+  markProcessed,
+  MESSAGING_TABLES_SQL,
+  OutboxMessage,
+  OutboxPublisher,
+  ProcessedEvent,
+} from &#x27;@app/messaging&#x27;;
+import { StartedPostgreSqlContainer } from &#x27;@testcontainers/postgresql&#x27;;
+import { DataSource } from &#x27;typeorm&#x27;;
+import { FakeProducer } from &#x27;../support/fake-producer&#x27;;
+import { startPostgres } from &#x27;../support/postgres&#x27;;
+
+const ORDER = &#x27;9f1e2d3c-4b5a-4c69-8d7e-6f5a4b3c2d1e&#x27;;
+const cancelled = (): OrderCancelled =&gt; ({ ...newEnvelope(ORDER), type: EventTypes.OrderCancelled });
+
+describe(&#x27;messaging persistence&#x27;, () =&gt; {
+  let pg: StartedPostgreSqlContainer;
+  let ds: DataSource;
+
+  beforeAll(async () =&gt; {
+    const started = await startPostgres();
+    pg = started.container;
+    ds = await new DataSource({ type: &#x27;postgres&#x27;, url: started.ordersUrl, entities: [OutboxMessage, ProcessedEvent] }).initialize();
+    await ds.query(MESSAGING_TABLES_SQL);
+  });
+  afterAll(async () =&gt; {
+    await ds?.destroy();
+    await pg?.stop();
+  });
+  beforeEach(() =&gt; ds.query(&#x27;TRUNCATE outbox, processed_events&#x27;));
+
+  describe(&#x27;markProcessed&#x27;, () =&gt; {
+    it(&#x27;returns true the first time and false for a repeat&#x27;, async () =&gt; {
+      const id = newEnvelope(ORDER).eventId;
+      await expect(ds.transaction((m) =&gt; markProcessed(m, id))).resolves.toBe(true);
+      await expect(ds.transaction((m) =&gt; markProcessed(m, id))).resolves.toBe(false);
+    });
+
+    it(&#x27;is rolled back with the transaction it ran in&#x27;, async () =&gt; {
+      const id = newEnvelope(ORDER).eventId;
+      await expect(
+        ds.transaction(async (m) =&gt; {
+          await markProcessed(m, id);
+          throw new Error(&#x27;handler failed&#x27;);
+        }),
+      ).rejects.toThrow(&#x27;handler failed&#x27;);
+      await expect(ds.transaction((m) =&gt; markProcessed(m, id))).resolves.toBe(true);
+    });
+  });
+
+  describe(&#x27;OutboxPublisher.publishBatch&#x27;, () =&gt; {
+    it(&#x27;publishes unsent rows in order, keyed by orderId, and marks them sent&#x27;, async () =&gt; {
+      const a = cancelled();
+      const b = cancelled();
+      await ds.transaction(async (m) =&gt; {
+        await enqueue(m, a);
+        await enqueue(m, b);
+      });
+      const producer = new FakeProducer();
+      const publisher = new OutboxPublisher(ds, producer, { intervalMs: 1000 });
+
+      await expect(publisher.publishBatch()).resolves.toBe(2);
+      expect(producer.sent.map((s) =&gt; JSON.parse(s.value).eventId)).toEqual([a.eventId, b.eventId]);
+      expect(producer.sent.every((s) =&gt; s.topic === &#x27;order-events&#x27; &amp;&amp; s.key === ORDER)).toBe(true);
+      await expect(publisher.publishBatch()).resolves.toBe(0);
+      expect(producer.sent).toHaveLength(2);
+    });
+
+    it(&#x27;keeps rows unsent when Kafka is down and sends them on the next run&#x27;, async () =&gt; {
+      await ds.transaction((m) =&gt; enqueue(m, cancelled()));
+      const producer = new FakeProducer();
+      producer.failNext = 1;
+      const publisher = new OutboxPublisher(ds, producer, { intervalMs: 1000 });
+
+      await expect(publisher.publishBatch()).rejects.toThrow(&#x27;broker unavailable&#x27;);
+      const [{ count }] = await ds.query(`SELECT count(*)::int AS count FROM outbox WHERE sent_at IS NULL`);
+      expect(count).toBe(1);
+
+      await expect(publisher.publishBatch()).resolves.toBe(1);
+      expect(producer.sent).toHaveLength(1);
+    });
+  });
+});</code></pre>
+<ul><li>[ ] <strong>Step 3: Run it to verify it fails</strong></li></ul>
+<p>Run: <code>npm run test:int -- test/int/messaging</code> Expected: FAIL, <code>enqueue</code> / <code>OutboxPublisher</code> not exported from <code>@app/messaging</code>.</p>
+<ul><li>[ ] <strong>Step 4: Implement</strong></li></ul>
+<p><code>libs/messaging/src/schema.ts</code>:</p>
+<pre><code>/** Tables every service needs for the outbox and the idempotency guard. Both apps&#x27; first migration runs this. */
+export const MESSAGING_TABLES_SQL = `
+  CREATE TABLE outbox (
+    seq         bigserial PRIMARY KEY,
+    event_id    uuid        NOT NULL UNIQUE,
+    topic       varchar(64) NOT NULL,
+    key         varchar(64) NOT NULL,
+    payload     jsonb       NOT NULL,
+    created_at  timestamptz NOT NULL DEFAULT now(),
+    sent_at     timestamptz
+  );
+  CREATE INDEX outbox_unsent_idx ON outbox (seq) WHERE sent_at IS NULL;
+  CREATE TABLE processed_events (
+    event_id     uuid PRIMARY KEY,
+    processed_at timestamptz NOT NULL DEFAULT now()
+  );
+`;
+
+export const DROP_MESSAGING_TABLES_SQL = `DROP TABLE processed_events; DROP TABLE outbox;`;</code></pre>
+<p><code>libs/messaging/src/idempotency.ts</code>:</p>
+<pre><code>import { CreateDateColumn, Entity, EntityManager, PrimaryColumn } from &#x27;typeorm&#x27;;
+
+@Entity(&#x27;processed_events&#x27;)
+export class ProcessedEvent {
+  @PrimaryColumn(&#x27;uuid&#x27;, { name: &#x27;event_id&#x27; })
+  eventId!: string;
+
+  @CreateDateColumn({ name: &#x27;processed_at&#x27;, type: &#x27;timestamptz&#x27; })
+  processedAt!: Date;
+}
+
+/**
+ * Records the event in the caller&#x27;s transaction. Returns false if it was already processed,
+ * so a redelivered Kafka message changes nothing.
+ */
+export async function markProcessed(m: EntityManager, eventId: string): Promise&lt;boolean&gt; {
+  const rows: unknown[] = await m.query(
+    &#x27;INSERT INTO processed_events (event_id) VALUES ($1) ON CONFLICT DO NOTHING RETURNING event_id&#x27;,
+    [eventId],
+  );
+  return rows.length === 1;
+}</code></pre>
+<p><code>libs/messaging/src/outbox.ts</code>:</p>
+<pre><code>import { AnyEvent, topicFor } from &#x27;@app/contracts&#x27;;
+import { Producer } from &#x27;kafkajs&#x27;;
+import { Column, CreateDateColumn, DataSource, Entity, EntityManager, In, PrimaryGeneratedColumn } from &#x27;typeorm&#x27;;
+import { LoggerLike } from &#x27;./logger&#x27;;
+import { errMessage } from &#x27;./retry&#x27;;
+
+@Entity(&#x27;outbox&#x27;)
+export class OutboxMessage {
+  @PrimaryGeneratedColumn(&#x27;increment&#x27;, { type: &#x27;bigint&#x27; })
+  seq!: string;
+
+  @Column(&#x27;uuid&#x27;, { name: &#x27;event_id&#x27;, unique: true })
+  eventId!: string;
+
+  @Column(&#x27;varchar&#x27;, { length: 64 })
+  topic!: string;
+
+  @Column(&#x27;varchar&#x27;, { length: 64 })
+  key!: string;
+
+  @Column(&#x27;jsonb&#x27;)
+  payload!: AnyEvent;
+
+  @CreateDateColumn({ name: &#x27;created_at&#x27;, type: &#x27;timestamptz&#x27; })
+  createdAt!: Date;
+
+  @Column(&#x27;timestamptz&#x27;, { name: &#x27;sent_at&#x27;, nullable: true })
+  sentAt!: Date | null;
+}
+
+/** Call inside the same transaction as the state change the event describes. */
+export async function enqueue(m: EntityManager, event: AnyEvent): Promise&lt;void&gt; {
+  await m.insert(OutboxMessage, { eventId: event.eventId, topic: topicFor(event.type), key: event.orderId, payload: event });
+}
+
+export type ProducerLike = Pick&lt;Producer, &#x27;connect&#x27; | &#x27;disconnect&#x27; | &#x27;sendBatch&#x27;&gt;;
+
+export interface OutboxPublisherOptions {
+  intervalMs: number;
+  batchSize?: number;
+  logger?: LoggerLike;
+}
+
+export class OutboxPublisher {
+  private timer?: NodeJS.Timeout;
+  private inFlight?: Promise&lt;void&gt;;
+
+  constructor(
+    private readonly ds: DataSource,
+    private readonly producer: ProducerLike,
+    private readonly o: OutboxPublisherOptions,
+  ) {}
+
+  async start(): Promise&lt;void&gt; {
+    await this.producer.connect();
+    this.timer = setInterval(() =&gt; {
+      if (this.inFlight) return; // never overlap two batches
+      this.inFlight = this.publishBatch()
+        .then(() =&gt; undefined)
+        .catch((e) =&gt; this.o.logger?.warn(`outbox publish failed, will retry: ${errMessage(e)}`))
+        .finally(() =&gt; {
+          this.inFlight = undefined;
+        });
+    }, this.o.intervalMs);
+  }
+
+  async stop(): Promise&lt;void&gt; {
+    clearInterval(this.timer);
+    await this.inFlight;
+    await this.producer.disconnect();
+  }
+
+  /**
+   * Sends the oldest unsent rows and marks them sent, in one transaction. If Kafka throws, the transaction
+   * rolls back and the rows go out on a later run. SKIP LOCKED lets two publisher instances share the table.
+   */
+  async publishBatch(): Promise&lt;number&gt; {
+    return this.ds.transaction(async (m) =&gt; {
+      const rows = await m
+        .createQueryBuilder(OutboxMessage, &#x27;o&#x27;)
+        .where(&#x27;o.sent_at IS NULL&#x27;)
+        .orderBy(&#x27;o.seq&#x27;, &#x27;ASC&#x27;)
+        .limit(this.o.batchSize ?? 100)
+        .setLock(&#x27;pessimistic_write&#x27;)
+        .setOnLocked(&#x27;skip_locked&#x27;)
+        .getMany();
+      if (rows.length === 0) return 0;
+
+      const byTopic = new Map&lt;string, { key: string; value: string }[]&gt;();
+      for (const row of rows) {
+        const list = byTopic.get(row.topic) ?? [];
+        list.push({ key: row.key, value: JSON.stringify(row.payload) });
+        byTopic.set(row.topic, list);
+      }
+      await this.producer.sendBatch({
+        topicMessages: [...byTopic].map(([topic, messages]) =&gt; ({ topic, messages })),
+      });
+      await m.update(OutboxMessage, { seq: In(rows.map((r) =&gt; r.seq)) }, { sentAt: new Date() });
+      return rows.length;
+    });
+  }
+}</code></pre>
+<p>Append to <code>libs/messaging/src/index.ts</code>:</p>
+<pre><code>export * from &#x27;./schema&#x27;;
+export * from &#x27;./idempotency&#x27;;
+export * from &#x27;./outbox&#x27;;</code></pre>
+<ul><li>[ ] <strong>Step 5: Run the tests</strong></li></ul>
+<p>Run: <code>npm run test:int -- test/int/messaging &amp;&amp; npm run lint &amp;&amp; npm run typecheck</code> Expected: PASS (the first run pulls <code>postgres:16-alpine</code>, which can take a minute).</p>
+<ul><li>[ ] <strong>Step 6: Commit</strong></li></ul>
+<pre><code>git add -A
+git commit -m &quot;feat(messaging): transactional outbox publisher and processed_events guard&quot;</code></pre>
+<hr>
+<h3 id="task-5-orders-persistence-and-ordersservice">Task 5: Orders persistence and <code>OrdersService</code></h3>
+<p><strong>Files:</strong></p>
+<ul><li>Create: <code>apps/orders/src/config.ts</code>, <code>data-source.ts</code>, <code>migrations/1728300000000-init-orders.ts</code>, <code>orders/order.entity.ts</code>, <code>orders/order-item.entity.ts</code>, <code>orders/orders.service.ts</code></li><li>Test: <code>test/int/orders.int-spec.ts</code></li></ul>
+<p><strong>Interfaces:</strong></p>
+<ul><li>Consumes: everything from Task 3; <code>enqueue</code>, <code>markProcessed</code>, <code>OutboxMessage</code>, <code>ProcessedEvent</code>, <code>MESSAGING_TABLES_SQL</code>, <code>DROP_MESSAGING_TABLES_SQL</code> (Task 4); <code>newEnvelope</code>, <code>EventTypes</code>, <code>OrderItemLine</code>, <code>StockEvent</code>, <code>OrderEvent</code> (Task 1).</li><li>Produces:</li><li><code>ordersConfig(): { databaseUrl: string; kafkaBrokers: string[]; port: number; outboxIntervalMs: number }</code></li><li><code>ordersDataSourceOptions(url: string): DataSourceOptions</code> (runs migrations on initialise)</li><li>entities <code>Order { id; status: OrderStatus; totalCents: number | null; rejectionReason: string | null; items: OrderItem[]; createdAt: Date; updatedAt: Date }</code>, <code>OrderItem { id; order; productId; quantity; unitPriceCents: number | null }</code></li><li><code>OrdersService(dataSource: DataSource)</code> with <code>create(items: OrderItemLine[]): Promise&lt;Order&gt;</code>, <code>pay(id: string): Promise&lt;Order&gt;</code>, <code>cancel(id: string): Promise&lt;Order&gt;</code>, <code>findById(id: string): Promise&lt;Order | null&gt;</code>, <code>list(o: { status?: OrderStatus | null; first?: number | null; after?: string | null }): Promise&lt;OrderPage&gt;</code>, <code>applyStockReply(e: StockEvent): Promise&lt;void&gt;</code>; <code>interface OrderPage { nodes: Order[]; endCursor: string | null; hasNextPage: boolean }</code></li></ul>
+<ul><li>[ ] <strong>Step 1: Write the failing integration test</strong></li></ul>
+<p><code>test/int/orders.int-spec.ts</code>:</p>
+<pre><code>import { EventTypes, newEnvelope, StockRejected, StockReserved } from &#x27;@app/contracts&#x27;;
+import { StartedPostgreSqlContainer } from &#x27;@testcontainers/postgresql&#x27;;
+import { DataSource } from &#x27;typeorm&#x27;;
+import { ordersDataSourceOptions } from &#x27;../../apps/orders/src/data-source&#x27;;
+import { InvalidInputError, OrderNotFoundError } from &#x27;../../apps/orders/src/orders/errors&#x27;;
+import { InvalidStateError } from &#x27;../../apps/orders/src/orders/order-state&#x27;;
+import { OrderStatus } from &#x27;../../apps/orders/src/orders/order-status&#x27;;
+import { OrdersService } from &#x27;../../apps/orders/src/orders/orders.service&#x27;;
+import { startPostgres } from &#x27;../support/postgres&#x27;;
+
+const KEYBOARD = &#x27;11111111-1111-4111-8111-111111111111&#x27;;
+const MOUSE = &#x27;22222222-2222-4222-8222-222222222222&#x27;;
+const MISSING = &#x27;99999999-9999-4999-8999-999999999999&#x27;;
+
+describe(&#x27;OrdersService (real PostgreSQL)&#x27;, () =&gt; {
+  let pg: StartedPostgreSqlContainer;
+  let ds: DataSource;
+  let orders: OrdersService;
+
+  const outboxTypes = async (orderId: string) =&gt;
+    (await ds.query(`SELECT payload-&gt;&gt;&#x27;type&#x27; AS type FROM outbox WHERE key = $1 ORDER BY seq`, [orderId])).map(
+      (r: { type: string }) =&gt; r.type,
+    );
+  const reserved = (orderId: string): StockReserved =&gt; ({
+    ...newEnvelope(orderId),
+    type: EventTypes.StockReserved,
+    lines: [
+      { productId: KEYBOARD, unitPriceCents: 8999 },
+      { productId: MOUSE, unitPriceCents: 2999 },
+    ],
+  });
+
+  beforeAll(async () =&gt; {
+    const started = await startPostgres();
+    pg = started.container;
+    ds = await new DataSource(ordersDataSourceOptions(started.ordersUrl)).initialize();
+    orders = new OrdersService(ds);
+  });
+  afterAll(async () =&gt; {
+    await ds?.destroy();
+    await pg?.stop();
+  });
+  beforeEach(() =&gt; ds.query(&#x27;TRUNCATE orders, order_items, outbox, processed_events CASCADE&#x27;));
+
+  it(&#x27;creates a PENDING order and its order.created outbox row together&#x27;, async () =&gt; {
+    const o = await orders.create([{ productId: KEYBOARD, quantity: 2 }]);
+    expect(o.status).toBe(OrderStatus.PENDING);
+    expect(o.items).toHaveLength(1);
+    expect(await outboxTypes(o.id)).toEqual([&#x27;order.created&#x27;]);
+  });
+
+  it(&#x27;saves nothing when the outbox write fails (both or neither)&#x27;, async () =&gt; {
+    await ds.query(&#x27;ALTER TABLE outbox ADD CONSTRAINT always_fail CHECK (false) NOT VALID&#x27;);
+    try {
+      await expect(orders.create([{ productId: KEYBOARD, quantity: 1 }])).rejects.toThrow();
+      const [{ count }] = await ds.query(&#x27;SELECT count(*)::int AS count FROM orders&#x27;);
+      expect(count).toBe(0);
+    } finally {
+      await ds.query(&#x27;ALTER TABLE outbox DROP CONSTRAINT always_fail&#x27;);
+    }
+  });
+
+  it(&#x27;rejects invalid input before touching the database&#x27;, async () =&gt; {
+    await expect(orders.create([])).rejects.toThrow(InvalidInputError);
+  });
+
+  it(&#x27;applies stock.reserved: RESERVED, prices filled in, total computed&#x27;, async () =&gt; {
+    const o = await orders.create([
+      { productId: KEYBOARD, quantity: 2 },
+      { productId: MOUSE, quantity: 1 },
+    ]);
+    await orders.applyStockReply(reserved(o.id));
+    const after = await orders.findById(o.id);
+    expect(after).toMatchObject({ status: OrderStatus.RESERVED, totalCents: 2 * 8999 + 2999 });
+    expect(after?.items.map((i) =&gt; i.unitPriceCents).sort()).toEqual([2999, 8999]);
+  });
+
+  it(&#x27;applies stock.rejected with its reason&#x27;, async () =&gt; {
+    const o = await orders.create([{ productId: KEYBOARD, quantity: 1 }]);
+    const rejected: StockRejected = { ...newEnvelope(o.id), type: EventTypes.StockRejected, reason: &#x27;INSUFFICIENT_STOCK&#x27; };
+    await orders.applyStockReply(rejected);
+    expect(await orders.findById(o.id)).toMatchObject({ status: OrderStatus.REJECTED, rejectionReason: &#x27;INSUFFICIENT_STOCK&#x27; });
+  });
+
+  it(&#x27;ignores a duplicate stock reply&#x27;, async () =&gt; {
+    const o = await orders.create([{ productId: KEYBOARD, quantity: 1 }]);
+    const reply = reserved(o.id);
+    await orders.applyStockReply(reply);
+    await orders.pay(o.id);
+    await orders.applyStockReply(reply); // redelivered after the order moved on
+    expect((await orders.findById(o.id))?.status).toBe(OrderStatus.PAID);
+  });
+
+  it(&#x27;ignores a stock reply for an order cancelled in the meantime&#x27;, async () =&gt; {
+    const o = await orders.create([{ productId: KEYBOARD, quantity: 1 }]);
+    await orders.cancel(o.id);
+    await orders.applyStockReply(reserved(o.id));
+    expect((await orders.findById(o.id))?.status).toBe(OrderStatus.CANCELLED);
+  });
+
+  it(&#x27;pays a RESERVED order and emits order.paid with the total&#x27;, async () =&gt; {
+    const o = await orders.create([{ productId: KEYBOARD, quantity: 1 }]);
+    await orders.applyStockReply(reserved(o.id));
+    await expect(orders.pay(o.id)).resolves.toMatchObject({ status: OrderStatus.PAID });
+    const [paid] = await ds.query(`SELECT payload FROM outbox WHERE key = $1 AND payload-&gt;&gt;&#x27;type&#x27; = &#x27;order.paid&#x27;`, [o.id]);
+    expect(paid.payload.totalCents).toBe(8999);
+  });
+
+  it(&#x27;refuses to pay a PENDING order&#x27;, async () =&gt; {
+    const o = await orders.create([{ productId: KEYBOARD, quantity: 1 }]);
+    await expect(orders.pay(o.id)).rejects.toThrow(InvalidStateError);
+    expect(await outboxTypes(o.id)).toEqual([&#x27;order.created&#x27;]);
+  });
+
+  it(&#x27;cancels and emits order.cancelled; a second cancel is INVALID_STATE&#x27;, async () =&gt; {
+    const o = await orders.create([{ productId: KEYBOARD, quantity: 1 }]);
+    await expect(orders.cancel(o.id)).resolves.toMatchObject({ status: OrderStatus.CANCELLED });
+    await expect(orders.cancel(o.id)).rejects.toThrow(InvalidStateError);
+    expect(await outboxTypes(o.id)).toEqual([&#x27;order.created&#x27;, &#x27;order.cancelled&#x27;]);
+  });
+
+  it(&#x27;NOT_FOUND for an unknown id, BAD_USER_INPUT for a non-UUID id&#x27;, async () =&gt; {
+    await expect(orders.pay(MISSING)).rejects.toThrow(OrderNotFoundError);
+    await expect(orders.cancel(&#x27;not-a-uuid&#x27;)).rejects.toThrow(InvalidInputError);
+    await expect(orders.findById(&#x27;not-a-uuid&#x27;)).rejects.toThrow(InvalidInputError);
+    await expect(orders.findById(MISSING)).resolves.toBeNull();
+  });
+
+  it(&#x27;pages through orders with a cursor, filters by status and caps first&#x27;, async () =&gt; {
+    const created = [];
+    for (let i = 0; i &lt; 3; i++) created.push(await orders.create([{ productId: KEYBOARD, quantity: 1 }]));
+    await orders.cancel(created[2].id);
+
+    const page1 = await orders.list({ first: 2 });
+    expect(page1.nodes.map((n) =&gt; n.id)).toEqual([created[0].id, created[1].id]);
+    expect(page1.hasNextPage).toBe(true);
+    const page2 = await orders.list({ first: 2, after: page1.endCursor });
+    expect(page2.nodes.map((n) =&gt; n.id)).toEqual([created[2].id]);
+    expect(page2.hasNextPage).toBe(false);
+
+    expect((await orders.list({ status: OrderStatus.CANCELLED })).nodes).toHaveLength(1);
+    expect((await orders.list({ first: 1000 })).nodes).toHaveLength(3);
+    await expect(orders.list({ after: &#x27;garbage&#x27; })).rejects.toThrow(InvalidInputError);
+  });
+});</code></pre>
+<ul><li>[ ] <strong>Step 2: Run it to verify it fails</strong></li></ul>
+<p>Run: <code>npm run test:int -- test/int/orders</code> Expected: FAIL, <code>Cannot find module '../../apps/orders/src/data-source'</code>.</p>
+<ul><li>[ ] <strong>Step 3: Implement config, entities, migration and data source</strong></li></ul>
+<p><code>apps/orders/src/config.ts</code>:</p>
+<pre><code>/** Read when a module initialises, never at import time, and every value has a local default. */
+export function ordersConfig() {
+  return {
+    databaseUrl: process.env.ORDERS_DATABASE_URL ?? &#x27;postgres://orderflow:orderflow@localhost:5432/orders&#x27;,
+    kafkaBrokers: (process.env.KAFKA_BROKERS ?? &#x27;localhost:9094&#x27;).split(&#x27;,&#x27;),
+    port: Number(process.env.ORDERS_PORT ?? 3000),
+    outboxIntervalMs: Number(process.env.OUTBOX_INTERVAL_MS ?? 500),
+  };
+}</code></pre>
+<p><code>apps/orders/src/orders/order.entity.ts</code>:</p>
+<pre><code>import { Column, CreateDateColumn, Entity, OneToMany, PrimaryGeneratedColumn, UpdateDateColumn } from &#x27;typeorm&#x27;;
+import { OrderItem } from &#x27;./order-item.entity&#x27;;
+import { OrderStatus } from &#x27;./order-status&#x27;;
+
+@Entity(&#x27;orders&#x27;)
+export class Order {
+  @PrimaryGeneratedColumn(&#x27;uuid&#x27;)
+  id!: string;
+
+  @Column(&#x27;varchar&#x27;, { length: 16 })
+  status!: OrderStatus;
+
+  @Column(&#x27;integer&#x27;, { name: &#x27;total_cents&#x27;, nullable: true })
+  totalCents!: number | null;
+
+  @Column(&#x27;varchar&#x27;, { name: &#x27;rejection_reason&#x27;, length: 32, nullable: true })
+  rejectionReason!: string | null;
+
+  // Not eager: FOR UPDATE can&#x27;t lock the nullable side of the LEFT JOIN an eager relation adds.
+  @OneToMany(() =&gt; OrderItem, (item) =&gt; item.order, { cascade: [&#x27;insert&#x27;] })
+  items!: OrderItem[];
+
+  @CreateDateColumn({ name: &#x27;created_at&#x27;, type: &#x27;timestamptz&#x27;, precision: 3 })
+  createdAt!: Date;
+
+  @UpdateDateColumn({ name: &#x27;updated_at&#x27;, type: &#x27;timestamptz&#x27;, precision: 3 })
+  updatedAt!: Date;
+}</code></pre>
+<p><code>apps/orders/src/orders/order-item.entity.ts</code>:</p>
+<pre><code>import { Column, Entity, JoinColumn, ManyToOne, PrimaryGeneratedColumn } from &#x27;typeorm&#x27;;
+import { Order } from &#x27;./order.entity&#x27;;
+
+@Entity(&#x27;order_items&#x27;)
+export class OrderItem {
+  @PrimaryGeneratedColumn(&#x27;uuid&#x27;)
+  id!: string;
+
+  @ManyToOne(() =&gt; Order, (order) =&gt; order.items, { onDelete: &#x27;CASCADE&#x27; })
+  @JoinColumn({ name: &#x27;order_id&#x27; })
+  order!: Order;
+
+  @Column(&#x27;uuid&#x27;, { name: &#x27;product_id&#x27; })
+  productId!: string;
+
+  @Column(&#x27;integer&#x27;)
+  quantity!: number;
+
+  @Column(&#x27;integer&#x27;, { name: &#x27;unit_price_cents&#x27;, nullable: true })
+  unitPriceCents!: number | null;
+}</code></pre>
+<p><code>apps/orders/src/migrations/1728300000000-init-orders.ts</code>:</p>
+<pre><code>import { DROP_MESSAGING_TABLES_SQL, MESSAGING_TABLES_SQL } from &#x27;@app/messaging&#x27;;
+import { MigrationInterface, QueryRunner } from &#x27;typeorm&#x27;;
+
+export class InitOrders1728300000000 implements MigrationInterface {
+  name = &#x27;InitOrders1728300000000&#x27;;
+
+  async up(q: QueryRunner): Promise&lt;void&gt; {
+    // timestamptz(3): millisecond precision, so a JS Date round-trips exactly in pagination cursors.
+    await q.query(`
+      CREATE TABLE orders (
+        id               uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+        status           varchar(16) NOT NULL,
+        total_cents      integer,
+        rejection_reason varchar(32),
+        created_at       timestamptz(3) NOT NULL DEFAULT now(),
+        updated_at       timestamptz(3) NOT NULL DEFAULT now()
+      );
+      CREATE INDEX orders_created_idx ON orders (created_at, id);
+      CREATE INDEX orders_status_created_idx ON orders (status, created_at, id);
+      CREATE TABLE order_items (
+        id               uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+        order_id         uuid NOT NULL REFERENCES orders(id) ON DELETE CASCADE,
+        product_id       uuid NOT NULL,
+        quantity         integer NOT NULL CHECK (quantity &gt; 0),
+        unit_price_cents integer
+      );
+      CREATE INDEX order_items_order_idx ON order_items (order_id);
+    `);
+    await q.query(MESSAGING_TABLES_SQL);
+  }
+
+  async down(q: QueryRunner): Promise&lt;void&gt; {
+    await q.query(DROP_MESSAGING_TABLES_SQL);
+    await q.query(&#x27;DROP TABLE order_items; DROP TABLE orders;&#x27;);
+  }
+}</code></pre>
+<p><code>apps/orders/src/data-source.ts</code>:</p>
+<pre><code>import { OutboxMessage, ProcessedEvent } from &#x27;@app/messaging&#x27;;
+import { DataSourceOptions } from &#x27;typeorm&#x27;;
+import { InitOrders1728300000000 } from &#x27;./migrations/1728300000000-init-orders&#x27;;
+import { OrderItem } from &#x27;./orders/order-item.entity&#x27;;
+import { Order } from &#x27;./orders/order.entity&#x27;;
+
+export function ordersDataSourceOptions(url: string): DataSourceOptions {
+  return {
+    type: &#x27;postgres&#x27;,
+    url,
+    entities: [Order, OrderItem, OutboxMessage, ProcessedEvent],
+    migrations: [InitOrders1728300000000],
+    migrationsRun: true,
+    synchronize: false,
+  };
+}</code></pre>
+<ul><li>[ ] <strong>Step 4: Implement <code>OrdersService</code></strong></li></ul>
+<p><code>apps/orders/src/orders/orders.service.ts</code>:</p>
+<pre><code>import { EventTypes, newEnvelope, OrderEvent, OrderItemLine, StockEvent } from &#x27;@app/contracts&#x27;;
+import { enqueue, markProcessed } from &#x27;@app/messaging&#x27;;
+import { Injectable } from &#x27;@nestjs/common&#x27;;
+import { DataSource, EntityManager } from &#x27;typeorm&#x27;;
+import { OrderNotFoundError } from &#x27;./errors&#x27;;
+import { assertUuid, validateItems } from &#x27;./order-input&#x27;;
+import { OrderItem } from &#x27;./order-item.entity&#x27;;
+import { assertTransition } from &#x27;./order-state&#x27;;
+import { OrderStatus } from &#x27;./order-status&#x27;;
+import { Order } from &#x27;./order.entity&#x27;;
+import { decodeCursor, encodeCursor, pageSize } from &#x27;./pagination&#x27;;
+
+export interface OrderPage {
+  nodes: Order[];
+  endCursor: string | null;
+  hasNextPage: boolean;
+}
+
+@Injectable()
+export class OrdersService {
+  constructor(private readonly dataSource: DataSource) {}
+
+  async create(items: OrderItemLine[]): Promise&lt;Order&gt; {
+    validateItems(items);
+    return this.dataSource.transaction(async (m) =&gt; {
+      const order = m.create(Order, {
+        status: OrderStatus.PENDING,
+        totalCents: null,
+        rejectionReason: null,
+        items: items.map((i) =&gt; m.create(OrderItem, { productId: i.productId, quantity: i.quantity, unitPriceCents: null })),
+      });
+      await m.save(order);
+      await enqueue(m, {
+        ...newEnvelope(order.id),
+        type: EventTypes.OrderCreated,
+        items: items.map(({ productId, quantity }) =&gt; ({ productId, quantity })),
+      });
+      return order;
+    });
+  }
+
+  pay(id: string): Promise&lt;Order&gt; {
+    return this.transition(id, OrderStatus.PAID, (o) =&gt; ({
+      ...newEnvelope(o.id),
+      type: EventTypes.OrderPaid,
+      totalCents: o.totalCents ?? 0,
+    }));
+  }
+
+  cancel(id: string): Promise&lt;Order&gt; {
+    return this.transition(id, OrderStatus.CANCELLED, (o) =&gt; ({ ...newEnvelope(o.id), type: EventTypes.OrderCancelled }));
+  }
+
+  async findById(id: string): Promise&lt;Order | null&gt; {
+    assertUuid(id, &#x27;id&#x27;);
+    return this.dataSource.getRepository(Order).findOne({ where: { id }, relations: { items: true } });
+  }
+
+  async list(o: { status?: OrderStatus | null; first?: number | null; after?: string | null }): Promise&lt;OrderPage&gt; {
+    const limit = pageSize(o.first);
+    const qb = this.dataSource
+      .getRepository(Order)
+      .createQueryBuilder(&#x27;o&#x27;)
+      .leftJoinAndSelect(&#x27;o.items&#x27;, &#x27;i&#x27;)
+      .orderBy(&#x27;o.createdAt&#x27;, &#x27;ASC&#x27;)
+      .addOrderBy(&#x27;o.id&#x27;, &#x27;ASC&#x27;)
+      .take(limit + 1);
+    if (o.status) qb.andWhere(&#x27;o.status = :status&#x27;, { status: o.status });
+    if (o.after) qb.andWhere(&#x27;(o.created_at, o.id) &gt; (:createdAt, :id)&#x27;, decodeCursor(o.after));
+    const rows = await qb.getMany();
+    const nodes = rows.slice(0, limit);
+    const last = nodes.at(-1);
+    return { nodes, hasNextPage: rows.length &gt; limit, endCursor: last ? encodeCursor(last) : null };
+  }
+
+  /** Consumer handler for stock-events. Idempotent, and a no-op once the order has left PENDING. */
+  async applyStockReply(event: StockEvent): Promise&lt;void&gt; {
+    await this.dataSource.transaction(async (m) =&gt; {
+      if (!(await markProcessed(m, event.eventId))) return;
+      const order = await m.findOne(Order, { where: { id: event.orderId }, lock: { mode: &#x27;pessimistic_write&#x27; } });
+      if (!order || order.status !== OrderStatus.PENDING) return;
+
+      if (event.type === EventTypes.StockReserved) {
+        const prices = new Map(event.lines.map((l) =&gt; [l.productId, l.unitPriceCents]));
+        const items = await m.find(OrderItem, { where: { order: { id: order.id } } });
+        let total = 0;
+        for (const item of items) {
+          item.unitPriceCents = prices.get(item.productId) ?? 0;
+          total += item.unitPriceCents * item.quantity;
+        }
+        await m.save(items);
+        order.status = OrderStatus.RESERVED;
+        order.totalCents = total;
+      } else {
+        order.status = OrderStatus.REJECTED;
+        order.rejectionReason = event.reason;
+      }
+      await m.save(order);
+    });
+  }
+
+  private async transition(id: string, to: OrderStatus, event: (o: Order) =&gt; OrderEvent): Promise&lt;Order&gt; {
+    assertUuid(id, &#x27;id&#x27;);
+    return this.dataSource.transaction(async (m: EntityManager) =&gt; {
+      const order = await m.findOne(Order, { where: { id }, lock: { mode: &#x27;pessimistic_write&#x27; } });
+      if (!order) throw new OrderNotFoundError(id);
+      assertTransition(order.status, to);
+      order.status = to;
+      await m.save(order);
+      await enqueue(m, event(order));
+      return m.findOneOrFail(Order, { where: { id }, relations: { items: true } });
+    });
+  }
+}</code></pre>
+<ul><li>[ ] <strong>Step 5: Run the tests</strong></li></ul>
+<p>Run: <code>npm run test:int -- test/int/orders &amp;&amp; npm run test:unit &amp;&amp; npm run lint &amp;&amp; npm run typecheck</code> Expected: PASS.</p>
+<ul><li>[ ] <strong>Step 6: Commit</strong></li></ul>
+<pre><code>git add -A
+git commit -m &quot;feat(orders): persistence, migration and OrdersService with outbox writes&quot;</code></pre>
+<hr>
+<h3 id="task-6-orders-graphql-api-nest-module-messaging-lifecycle">Task 6: Orders GraphQL API, Nest module, messaging lifecycle</h3>
+<p><strong>Files:</strong></p>
+<ul><li>Create: <code>apps/orders/src/orders/graphql.models.ts</code>, <code>graphql-errors.ts</code>, <code>orders.resolver.ts</code>, <code>apps/orders/src/health.controller.ts</code>, <code>messaging.lifecycle.ts</code>, <code>app.module.ts</code>, <code>main.ts</code></li><li>Test: <code>test/int/orders-graphql.int-spec.ts</code></li></ul>
+<p><strong>Interfaces:</strong></p>
+<ul><li>Consumes: <code>OrdersService</code>, <code>ordersConfig</code>, <code>ordersDataSourceOptions</code> (Task 5); <code>createKafka</code>, <code>ensureTopics</code>, <code>OutboxPublisher</code>, <code>EventConsumer</code> (Tasks 2 and 4); <code>Topics</code>, <code>StockEvent</code> (Task 1).</li><li>Produces:</li><li><code>OrdersAppModule</code> (Nest module). GraphQL at <code>POST /graphql</code>, <code>GET /health</code> → <code>{ status: 'ok' }</code>.</li><li><code>OrdersMessaging</code> provider: on bootstrap ensures topics, starts the outbox publisher and the <code>stock-events</code> consumer (group <code>orders</code>); stops both in <code>beforeApplicationShutdown</code>. <strong>Skipped when <code>ORDERS_MESSAGING=off</code></strong> (used by the GraphQL integration test, which has no Kafka).</li><li>GraphQL schema: <code>createOrder(items: [OrderItemInput!]!): Order!</code>, <code>payOrder(id: ID!): Order!</code>, <code>cancelOrder(id: ID!): Order!</code>, <code>order(id: ID!): Order</code>, <code>orders(status: OrderStatus, first: Int, after: String): OrderPage!</code></li></ul>
+<ul><li>[ ] <strong>Step 1: Write the failing GraphQL integration test</strong></li></ul>
+<p><code>test/int/orders-graphql.int-spec.ts</code>:</p>
+<pre><code>import { INestApplication } from &#x27;@nestjs/common&#x27;;
+import { NestFactory } from &#x27;@nestjs/core&#x27;;
+import { StartedPostgreSqlContainer } from &#x27;@testcontainers/postgresql&#x27;;
+import request from &#x27;supertest&#x27;;
+import { OrdersAppModule } from &#x27;../../apps/orders/src/app.module&#x27;;
+import { startPostgres } from &#x27;../support/postgres&#x27;;
+
+const KEYBOARD = &#x27;11111111-1111-4111-8111-111111111111&#x27;;
+type GqlResponse = { data?: Record&lt;string, unknown&gt; | null; errors?: { message: string; extensions?: { code?: string } }[] };
+
+describe(&#x27;orders GraphQL API (real PostgreSQL, no Kafka)&#x27;, () =&gt; {
+  let pg: StartedPostgreSqlContainer;
+  let app: INestApplication;
+
+  const gql = async (query: string, variables?: object): Promise&lt;GqlResponse&gt; =&gt;
+    (await request(app.getHttpServer()).post(&#x27;/graphql&#x27;).send({ query, variables })).body;
+
+  beforeAll(async () =&gt; {
+    const started = await startPostgres();
+    pg = started.container;
+    process.env.ORDERS_DATABASE_URL = started.ordersUrl;
+    process.env.ORDERS_MESSAGING = &#x27;off&#x27;;
+    app = await NestFactory.create(OrdersAppModule, { logger: [&#x27;error&#x27;, &#x27;warn&#x27;] });
+    await app.init();
+  });
+  afterAll(async () =&gt; {
+    await app?.close();
+    await pg?.stop();
+    delete process.env.ORDERS_MESSAGING;
+  });
+
+  it(&#x27;answers the health check&#x27;, async () =&gt; {
+    await request(app.getHttpServer()).get(&#x27;/health&#x27;).expect(200, { status: &#x27;ok&#x27; });
+  });
+
+  it(&#x27;creates an order and reads it back&#x27;, async () =&gt; {
+    const created = await gql(`mutation($items: [OrderItemInput!]!) { createOrder(items: $items) { id status totalCents } }`, {
+      items: [{ productId: KEYBOARD, quantity: 2 }],
+    });
+    expect(created.errors).toBeUndefined();
+    const order = created.data?.createOrder as { id: string; status: string; totalCents: number | null };
+    expect(order).toMatchObject({ status: &#x27;PENDING&#x27;, totalCents: null });
+
+    const read = await gql(`query($id: ID!) { order(id: $id) { id status items { productId quantity } } }`, { id: order.id });
+    expect(read.data?.order).toMatchObject({ id: order.id, items: [{ productId: KEYBOARD, quantity: 2 }] });
+  });
+
+  it.each([
+    [&#x27;no items&#x27;, []],
+    [&#x27;quantity 0&#x27;, [{ productId: KEYBOARD, quantity: 0 }]],
+    [&#x27;a non-UUID productId&#x27;, [{ productId: &#x27;keyboard&#x27;, quantity: 1 }]],
+  ])(&#x27;returns BAD_USER_INPUT for %s&#x27;, async (_label, items) =&gt; {
+    const res = await gql(`mutation($items: [OrderItemInput!]!) { createOrder(items: $items) { id } }`, { items });
+    expect(res.errors?.[0]?.extensions?.code).toBe(&#x27;BAD_USER_INPUT&#x27;);
+  });
+
+  it(&#x27;returns BAD_USER_INPUT, not a server error, for a non-UUID id&#x27;, async () =&gt; {
+    const res = await gql(`query { order(id: &quot;nope&quot;) { id } }`);
+    expect(res.errors?.[0]?.extensions?.code).toBe(&#x27;BAD_USER_INPUT&#x27;);
+  });
+
+  it(&#x27;returns NOT_FOUND when paying an order that does not exist&#x27;, async () =&gt; {
+    const res = await gql(`mutation { payOrder(id: &quot;99999999-9999-4999-8999-999999999999&quot;) { id } }`);
+    expect(res.errors?.[0]?.extensions?.code).toBe(&#x27;NOT_FOUND&#x27;);
+  });
+
+  it(&#x27;returns INVALID_STATE when paying a PENDING order&#x27;, async () =&gt; {
+    const created = await gql(`mutation($items: [OrderItemInput!]!) { createOrder(items: $items) { id } }`, {
+      items: [{ productId: KEYBOARD, quantity: 1 }],
+    });
+    const id = (created.data?.createOrder as { id: string }).id;
+    const res = await gql(`mutation($id: ID!) { payOrder(id: $id) { id } }`, { id });
+    expect(res.errors?.[0]?.extensions?.code).toBe(&#x27;INVALID_STATE&#x27;);
+  });
+
+  it(&#x27;lists orders with a page cursor&#x27;, async () =&gt; {
+    const res = await gql(`query { orders(first: 1) { nodes { id } endCursor hasNextPage } }`);
+    expect(res.data?.orders).toMatchObject({ hasNextPage: true });
+  });
+
+  it(&#x27;returns BAD_USER_INPUT for first: 0&#x27;, async () =&gt; {
+    const res = await gql(`query { orders(first: 0) { nodes { id } } }`);
+    expect(res.errors?.[0]?.extensions?.code).toBe(&#x27;BAD_USER_INPUT&#x27;);
+  });
+});</code></pre>
+<ul><li>[ ] <strong>Step 2: Run it to verify it fails</strong></li></ul>
+<p>Run: <code>npm run test:int -- test/int/orders-graphql</code> Expected: FAIL, <code>Cannot find module '../../apps/orders/src/app.module'</code>.</p>
+<ul><li>[ ] <strong>Step 3: Implement the GraphQL layer</strong></li></ul>
+<p><code>apps/orders/src/orders/graphql.models.ts</code>:</p>
+<pre><code>import { Field, GraphQLISODateTime, ID, InputType, Int, ObjectType, registerEnumType } from &#x27;@nestjs/graphql&#x27;;
+import { OrderStatus } from &#x27;./order-status&#x27;;
+
+registerEnumType(OrderStatus, { name: &#x27;OrderStatus&#x27; });
+
+@ObjectType(&#x27;OrderItem&#x27;)
+export class OrderItemModel {
+  @Field(() =&gt; ID) productId!: string;
+  @Field(() =&gt; Int) quantity!: number;
+  @Field(() =&gt; Int, { nullable: true }) unitPriceCents!: number | null;
+}
+
+@ObjectType(&#x27;Order&#x27;)
+export class OrderModel {
+  @Field(() =&gt; ID) id!: string;
+  @Field(() =&gt; OrderStatus) status!: OrderStatus;
+  @Field(() =&gt; Int, { nullable: true, description: &#x27;Known once inventory has reserved the stock&#x27; }) totalCents!: number | null;
+  @Field(() =&gt; String, { nullable: true }) rejectionReason!: string | null;
+  @Field(() =&gt; [OrderItemModel]) items!: OrderItemModel[];
+  @Field(() =&gt; GraphQLISODateTime) createdAt!: Date;
+}
+
+@ObjectType(&#x27;OrderPage&#x27;)
+export class OrderPageModel {
+  @Field(() =&gt; [OrderModel]) nodes!: OrderModel[];
+  @Field(() =&gt; String, { nullable: true }) endCursor!: string | null;
+  @Field(() =&gt; Boolean) hasNextPage!: boolean;
+}
+
+@InputType()
+export class OrderItemInput {
+  @Field(() =&gt; ID) productId!: string;
+  @Field(() =&gt; Int) quantity!: number;
+}</code></pre>
+<p><code>apps/orders/src/orders/graphql-errors.ts</code>:</p>
+<pre><code>import { GraphQLError } from &#x27;graphql&#x27;;
+import { InvalidInputError, OrderNotFoundError } from &#x27;./errors&#x27;;
+import { InvalidStateError } from &#x27;./order-state&#x27;;
+
+/** Maps domain errors to stable GraphQL error codes; anything else stays an internal error. */
+export async function withGraphQLErrors&lt;T&gt;(fn: () =&gt; Promise&lt;T&gt;): Promise&lt;T&gt; {
+  try {
+    return await fn();
+  } catch (e) {
+    if (e instanceof InvalidInputError) throw new GraphQLError(e.message, { extensions: { code: &#x27;BAD_USER_INPUT&#x27; } });
+    if (e instanceof OrderNotFoundError) throw new GraphQLError(e.message, { extensions: { code: &#x27;NOT_FOUND&#x27; } });
+    if (e instanceof InvalidStateError) throw new GraphQLError(e.message, { extensions: { code: &#x27;INVALID_STATE&#x27; } });
+    throw e;
+  }
+}</code></pre>
+<p><code>apps/orders/src/orders/orders.resolver.ts</code>:</p>
+<pre><code>import { Args, ID, Int, Mutation, Query, Resolver } from &#x27;@nestjs/graphql&#x27;;
+import { withGraphQLErrors } from &#x27;./graphql-errors&#x27;;
+import { OrderItemInput, OrderModel, OrderPageModel } from &#x27;./graphql.models&#x27;;
+import { OrderStatus } from &#x27;./order-status&#x27;;
+import { OrderPage, OrdersService } from &#x27;./orders.service&#x27;;
+import { Order } from &#x27;./order.entity&#x27;;
+
+@Resolver(() =&gt; OrderModel)
+export class OrdersResolver {
+  constructor(private readonly orders: OrdersService) {}
+
+  @Mutation(() =&gt; OrderModel)
+  createOrder(@Args(&#x27;items&#x27;, { type: () =&gt; [OrderItemInput] }) items: OrderItemInput[]): Promise&lt;Order&gt; {
+    return withGraphQLErrors(() =&gt; this.orders.create(items));
+  }
+
+  @Mutation(() =&gt; OrderModel, { description: &#x27;Simulated payment; only a RESERVED order can be paid&#x27; })
+  payOrder(@Args(&#x27;id&#x27;, { type: () =&gt; ID }) id: string): Promise&lt;Order&gt; {
+    return withGraphQLErrors(() =&gt; this.orders.pay(id));
+  }
+
+  @Mutation(() =&gt; OrderModel)
+  cancelOrder(@Args(&#x27;id&#x27;, { type: () =&gt; ID }) id: string): Promise&lt;Order&gt; {
+    return withGraphQLErrors(() =&gt; this.orders.cancel(id));
+  }
+
+  @Query(() =&gt; OrderModel, { nullable: true })
+  order(@Args(&#x27;id&#x27;, { type: () =&gt; ID }) id: string): Promise&lt;Order | null&gt; {
+    return withGraphQLErrors(() =&gt; this.orders.findById(id));
+  }
+
+  @Query(() =&gt; OrderPageModel)
+  orders(
+    @Args(&#x27;status&#x27;, { type: () =&gt; OrderStatus, nullable: true }) status?: OrderStatus | null,
+    @Args(&#x27;first&#x27;, { type: () =&gt; Int, nullable: true }) first?: number | null,
+    @Args(&#x27;after&#x27;, { type: () =&gt; String, nullable: true }) after?: string | null,
+  ): Promise&lt;OrderPage&gt; {
+    return withGraphQLErrors(() =&gt; this.orders.list({ status, first, after }));
+  }
+}</code></pre>
+<ul><li>[ ] <strong>Step 4: Implement the module, lifecycle, health check and entry point</strong></li></ul>
+<p><code>apps/orders/src/health.controller.ts</code>:</p>
+<pre><code>import { Controller, Get } from &#x27;@nestjs/common&#x27;;
+
+@Controller(&#x27;health&#x27;)
+export class HealthController {
+  @Get()
+  check(): { status: &#x27;ok&#x27; } {
+    return { status: &#x27;ok&#x27; };
+  }
+}</code></pre>
+<p><code>apps/orders/src/messaging.lifecycle.ts</code>:</p>
+<pre><code>import { StockEvent, Topics } from &#x27;@app/contracts&#x27;;
+import { createKafka, ensureTopics, EventConsumer, OutboxPublisher } from &#x27;@app/messaging&#x27;;
+import { BeforeApplicationShutdown, Injectable, Logger, OnApplicationBootstrap } from &#x27;@nestjs/common&#x27;;
+import { DataSource } from &#x27;typeorm&#x27;;
+import { ordersConfig } from &#x27;./config&#x27;;
+import { OrdersService } from &#x27;./orders/orders.service&#x27;;
+
+@Injectable()
+export class OrdersMessaging implements OnApplicationBootstrap, BeforeApplicationShutdown {
+  private publisher?: OutboxPublisher;
+  private consumer?: EventConsumer;
+
+  constructor(
+    private readonly dataSource: DataSource,
+    private readonly orders: OrdersService,
+  ) {}
+
+  async onApplicationBootstrap(): Promise&lt;void&gt; {
+    if (process.env.ORDERS_MESSAGING === &#x27;off&#x27;) return;
+    const cfg = ordersConfig();
+    const kafka = createKafka(&#x27;orders&#x27;, cfg.kafkaBrokers);
+    await ensureTopics(kafka);
+    this.publisher = new OutboxPublisher(this.dataSource, kafka.producer({ maxInFlightRequests: 1 }), {
+      intervalMs: cfg.outboxIntervalMs,
+      logger: new Logger(&#x27;OrdersOutbox&#x27;),
+    });
+    await this.publisher.start();
+    this.consumer = new EventConsumer({
+      kafka,
+      groupId: &#x27;orders&#x27;,
+      topic: Topics.StockEvents,
+      handle: (e) =&gt; this.orders.applyStockReply(e as StockEvent), // parseEvent guarantees stock-events carry stock events
+      logger: new Logger(&#x27;StockEventsConsumer&#x27;),
+    });
+    await this.consumer.start();
+  }
+
+  // Before TypeORM closes its pool, so an in-flight batch can finish.
+  async beforeApplicationShutdown(): Promise&lt;void&gt; {
+    await this.consumer?.stop();
+    await this.publisher?.stop();
+  }
+}</code></pre>
+<p><code>apps/orders/src/app.module.ts</code>:</p>
+<pre><code>import { ApolloDriver, ApolloDriverConfig } from &#x27;@nestjs/apollo&#x27;;
+import { Module } from &#x27;@nestjs/common&#x27;;
+import { GraphQLModule } from &#x27;@nestjs/graphql&#x27;;
+import { TypeOrmModule } from &#x27;@nestjs/typeorm&#x27;;
+import { ordersConfig } from &#x27;./config&#x27;;
+import { ordersDataSourceOptions } from &#x27;./data-source&#x27;;
+import { HealthController } from &#x27;./health.controller&#x27;;
+import { OrdersMessaging } from &#x27;./messaging.lifecycle&#x27;;
+import { OrdersResolver } from &#x27;./orders/orders.resolver&#x27;;
+import { OrdersService } from &#x27;./orders/orders.service&#x27;;
+
+@Module({
+  imports: [
+    GraphQLModule.forRoot&lt;ApolloDriverConfig&gt;({ driver: ApolloDriver, autoSchemaFile: true, sortSchema: true }),
+    TypeOrmModule.forRootAsync({ useFactory: () =&gt; ordersDataSourceOptions(ordersConfig().databaseUrl) }),
+  ],
+  controllers: [HealthController],
+  providers: [OrdersService, OrdersResolver, OrdersMessaging],
+})
+export class OrdersAppModule {}</code></pre>
+<p><code>apps/orders/src/main.ts</code>:</p>
+<pre><code>import { NestFactory } from &#x27;@nestjs/core&#x27;;
+import { OrdersAppModule } from &#x27;./app.module&#x27;;
+import { ordersConfig } from &#x27;./config&#x27;;
+
+async function bootstrap(): Promise&lt;void&gt; {
+  const app = await NestFactory.create(OrdersAppModule);
+  app.enableShutdownHooks();
+  await app.listen(ordersConfig().port);
+}
+void bootstrap();</code></pre>
+<ul><li>[ ] <strong>Step 5: Run the tests and the build</strong></li></ul>
+<p>Run: <code>npm run test:int -- test/int/orders-graphql &amp;&amp; npm run lint &amp;&amp; npm run typecheck &amp;&amp; npx nest build orders</code> Expected: tests PASS; <code>dist/apps/orders/main.js</code> exists.</p>
+<ul><li>[ ] <strong>Step 6: Commit</strong></li></ul>
+<pre><code>git add -A
+git commit -m &quot;feat(orders): GraphQL API with error codes, health check, messaging lifecycle&quot;</code></pre>
+<hr>
+<h3 id="task-7-inventory-stock-rules-pure">Task 7: Inventory stock rules (pure)</h3>
+<p><strong>Files:</strong></p>
+<ul><li>Create: <code>apps/inventory/src/stock/stock.ts</code>, <code>apps/inventory/src/stock/seed.ts</code></li><li>Test: <code>apps/inventory/src/stock/stock.spec.ts</code></li></ul>
+<p><strong>Interfaces:</strong></p>
+<ul><li>Consumes: <code>OrderItemLine</code>, <code>PricedLine</code>, <code>RejectionReason</code> from <code>@app/contracts</code>.</li><li>Produces:</li><li><code>aggregate(items: OrderItemLine[]): OrderItemLine[]</code> (sums duplicates, sorted by <code>productId</code>)</li><li><code>interface StockRow { id: string; stockAvailable: number; priceCents: number }</code></li><li><code>type ReserveDecision = { ok: true; lines: PricedLine[] } | { ok: false; reason: RejectionReason }</code></li><li><code>decideReservation(items: OrderItemLine[], products: Map&lt;string, StockRow&gt;): ReserveDecision</code></li><li><code>SEED_PRODUCTS: readonly { id: string; sku: string; name: string; priceCents: number; stock: number }[]</code></li></ul>
+<ul><li>[ ] <strong>Step 1: Write the failing test</strong></li></ul>
+<p><code>apps/inventory/src/stock/stock.spec.ts</code>:</p>
+<pre><code>import { aggregate, decideReservation, StockRow } from &#x27;./stock&#x27;;
+
+const K = &#x27;11111111-1111-4111-8111-111111111111&#x27;;
+const M = &#x27;22222222-2222-4222-8222-222222222222&#x27;;
+const stock = (rows: StockRow[]) =&gt; new Map(rows.map((r) =&gt; [r.id, r]));
+const shelf = stock([
+  { id: K, stockAvailable: 10, priceCents: 8999 },
+  { id: M, stockAvailable: 1, priceCents: 2999 },
+]);
+
+describe(&#x27;aggregate&#x27;, () =&gt; {
+  it(&#x27;sums the same product appearing twice and sorts by id&#x27;, () =&gt; {
+    expect(aggregate([{ productId: M, quantity: 1 }, { productId: K, quantity: 2 }, { productId: K, quantity: 3 }])).toEqual([
+      { productId: K, quantity: 5 },
+      { productId: M, quantity: 1 },
+    ]);
+  });
+});
+
+describe(&#x27;decideReservation&#x27;, () =&gt; {
+  it(&#x27;reserves when every line fits, returning unit prices&#x27;, () =&gt; {
+    expect(decideReservation([{ productId: K, quantity: 10 }], shelf)).toEqual({
+      ok: true,
+      lines: [{ productId: K, unitPriceCents: 8999 }],
+    });
+  });
+
+  it(&#x27;rejects with INSUFFICIENT_STOCK when any line exceeds stock&#x27;, () =&gt; {
+    expect(decideReservation([{ productId: K, quantity: 1 }, { productId: M, quantity: 2 }], shelf)).toEqual({
+      ok: false,
+      reason: &#x27;INSUFFICIENT_STOCK&#x27;,
+    });
+  });
+
+  it(&#x27;rejects with UNKNOWN_PRODUCT before checking quantities&#x27;, () =&gt; {
+    expect(decideReservation([{ productId: &#x27;99999999-9999-4999-8999-999999999999&#x27;, quantity: 1 }], shelf)).toEqual({
+      ok: false,
+      reason: &#x27;UNKNOWN_PRODUCT&#x27;,
+    });
+  });
+
+  it(&#x27;judges duplicates by their combined quantity&#x27;, () =&gt; {
+    expect(decideReservation(aggregate([{ productId: M, quantity: 1 }, { productId: M, quantity: 1 }]), shelf)).toMatchObject({
+      ok: false,
+      reason: &#x27;INSUFFICIENT_STOCK&#x27;,
+    });
+  });
+});</code></pre>
+<ul><li>[ ] <strong>Step 2: Run it to verify it fails</strong></li></ul>
+<p>Run: <code>npx jest --selectProjects unit apps/inventory</code> Expected: FAIL, <code>Cannot find module './stock'</code>.</p>
+<ul><li>[ ] <strong>Step 3: Implement</strong></li></ul>
+<p><code>apps/inventory/src/stock/stock.ts</code>:</p>
+<pre><code>import { OrderItemLine, PricedLine, RejectionReason } from &#x27;@app/contracts&#x27;;
+
+export interface StockRow {
+  id: string;
+  stockAvailable: number;
+  priceCents: number;
+}
+
+export type ReserveDecision = { ok: true; lines: PricedLine[] } | { ok: false; reason: RejectionReason };
+
+/** Sums repeated products (the API forbids them, but other producers might not) and sorts by id for lock order. */
+export function aggregate(items: OrderItemLine[]): OrderItemLine[] {
+  const totals = new Map&lt;string, number&gt;();
+  for (const i of items) totals.set(i.productId, (totals.get(i.productId) ?? 0) + i.quantity);
+  return [...totals]
+    .sort(([a], [b]) =&gt; (a &lt; b ? -1 : a &gt; b ? 1 : 0))
+    .map(([productId, quantity]) =&gt; ({ productId, quantity }));
+}
+
+export function decideReservation(items: OrderItemLine[], products: Map&lt;string, StockRow&gt;): ReserveDecision {
+  if (items.some((i) =&gt; !products.has(i.productId))) return { ok: false, reason: &#x27;UNKNOWN_PRODUCT&#x27; };
+  if (items.some((i) =&gt; products.get(i.productId)!.stockAvailable &lt; i.quantity)) {
+    return { ok: false, reason: &#x27;INSUFFICIENT_STOCK&#x27; };
+  }
+  return { ok: true, lines: items.map((i) =&gt; ({ productId: i.productId, unitPriceCents: products.get(i.productId)!.priceCents })) };
+}</code></pre>
+<p><code>apps/inventory/src/stock/seed.ts</code>:</p>
+<pre><code>/** Seeded by the first migration; the README and the tests use these IDs. */
+export const SEED_PRODUCTS = [
+  { id: &#x27;11111111-1111-4111-8111-111111111111&#x27;, sku: &#x27;KB-01&#x27;, name: &#x27;Mechanical keyboard&#x27;, priceCents: 8999, stock: 10 },
+  { id: &#x27;22222222-2222-4222-8222-222222222222&#x27;, sku: &#x27;MS-01&#x27;, name: &#x27;Wireless mouse&#x27;, priceCents: 2999, stock: 5 },
+  { id: &#x27;33333333-3333-4333-8333-333333333333&#x27;, sku: &#x27;MN-01&#x27;, name: &#x27;27-inch monitor&#x27;, priceCents: 24999, stock: 1 },
+] as const;</code></pre>
+<ul><li>[ ] <strong>Step 4: Run the tests</strong></li></ul>
+<p>Run: <code>npx jest --selectProjects unit apps/inventory &amp;&amp; npm run lint &amp;&amp; npm run typecheck</code> Expected: PASS. (<code>no-non-null-assertion</code> is not in the recommended set; if lint flags <code>!</code>, replace with a local <code>const p = products.get(...)</code> guard.)</p>
+<ul><li>[ ] <strong>Step 5: Commit</strong></li></ul>
+<pre><code>git add -A
+git commit -m &quot;feat(inventory): stock reservation rules and seed catalogue&quot;</code></pre>
+<hr>
+<h3 id="task-8-inventory-persistence-and-reservationservice">Task 8: Inventory persistence and <code>ReservationService</code></h3>
+<p><strong>Files:</strong></p>
+<ul><li>Create: <code>apps/inventory/src/config.ts</code>, <code>data-source.ts</code>, <code>migrations/1728300000001-init-inventory.ts</code>, <code>stock/product.entity.ts</code>, <code>stock/reservation.entity.ts</code>, <code>stock/reservation.service.ts</code></li><li>Test: <code>test/int/inventory.int-spec.ts</code></li></ul>
+<p><strong>Interfaces:</strong></p>
+<ul><li>Consumes: Task 7; <code>enqueue</code>, <code>markProcessed</code>, <code>OutboxMessage</code>, <code>ProcessedEvent</code>, messaging SQL (Task 4); <code>EventTypes</code>, <code>newEnvelope</code>, <code>OrderCreated</code>, <code>OrderCancelled</code>, <code>OrderEvent</code> (Task 1).</li><li>Produces:</li><li><code>inventoryConfig(): { databaseUrl: string; kafkaBrokers: string[]; outboxIntervalMs: number }</code></li><li><code>inventoryDataSourceOptions(url: string): DataSourceOptions</code></li><li>entities <code>Product { id; sku; name; priceCents; stockAvailable }</code>, <code>Reservation { id; orderId; productId; quantity; status: 'ACTIVE' | 'RELEASED' }</code></li><li><code>ReservationService(dataSource)</code> with <code>handle(e: OrderEvent): Promise&lt;void&gt;</code> (dispatch), <code>reserve(e: OrderCreated): Promise&lt;void&gt;</code>, <code>release(e: OrderCancelled): Promise&lt;void&gt;</code></li></ul>
+<ul><li>[ ] <strong>Step 1: Write the failing integration test</strong></li></ul>
+<p><code>test/int/inventory.int-spec.ts</code>:</p>
+<pre><code>import { EventTypes, newEnvelope, OrderCancelled, OrderCreated, OrderItemLine } from &#x27;@app/contracts&#x27;;
+import { StartedPostgreSqlContainer } from &#x27;@testcontainers/postgresql&#x27;;
+import { randomUUID } from &#x27;node:crypto&#x27;;
+import { DataSource } from &#x27;typeorm&#x27;;
+import { inventoryDataSourceOptions } from &#x27;../../apps/inventory/src/data-source&#x27;;
+import { ReservationService } from &#x27;../../apps/inventory/src/stock/reservation.service&#x27;;
+import { SEED_PRODUCTS } from &#x27;../../apps/inventory/src/stock/seed&#x27;;
+import { startPostgres } from &#x27;../support/postgres&#x27;;
+
+const [KEYBOARD, MOUSE, MONITOR] = SEED_PRODUCTS.map((p) =&gt; p.id);
+const created = (items: OrderItemLine[], orderId = randomUUID()): OrderCreated =&gt; ({
+  ...newEnvelope(orderId),
+  type: EventTypes.OrderCreated,
+  items,
+});
+const cancelled = (orderId: string): OrderCancelled =&gt; ({ ...newEnvelope(orderId), type: EventTypes.OrderCancelled });
+
+describe(&#x27;ReservationService (real PostgreSQL)&#x27;, () =&gt; {
+  let pg: StartedPostgreSqlContainer;
+  let ds: DataSource;
+  let service: ReservationService;
+
+  const stockOf = async (id: string): Promise&lt;number&gt; =&gt;
+    (await ds.query(&#x27;SELECT stock_available FROM products WHERE id = $1&#x27;, [id]))[0].stock_available;
+  const replies = async (orderId: string) =&gt;
+    (await ds.query(`SELECT payload FROM outbox WHERE key = $1 ORDER BY seq`, [orderId])).map((r: { payload: unknown }) =&gt; r.payload);
+  const reservationRows = async (orderId: string) =&gt;
+    ds.query(&#x27;SELECT product_id, quantity, status FROM reservations WHERE order_id = $1 ORDER BY product_id&#x27;, [orderId]);
+
+  beforeAll(async () =&gt; {
+    const started = await startPostgres();
+    pg = started.container;
+    ds = await new DataSource(inventoryDataSourceOptions(started.inventoryUrl)).initialize();
+    service = new ReservationService(ds);
+  });
+  afterAll(async () =&gt; {
+    await ds?.destroy();
+    await pg?.stop();
+  });
+  beforeEach(async () =&gt; {
+    await ds.query(&#x27;TRUNCATE reservations, outbox, processed_events&#x27;);
+    for (const p of SEED_PRODUCTS) await ds.query(&#x27;UPDATE products SET stock_available = $2 WHERE id = $1&#x27;, [p.id, p.stock]);
+  });
+
+  it(&#x27;reserves stock and writes stock.reserved with unit prices to its outbox&#x27;, async () =&gt; {
+    const e = created([{ productId: KEYBOARD, quantity: 3 }]);
+    await service.handle(e);
+    expect(await stockOf(KEYBOARD)).toBe(7);
+    expect(await replies(e.orderId)).toEqual([
+      expect.objectContaining({ type: &#x27;stock.reserved&#x27;, lines: [{ productId: KEYBOARD, unitPriceCents: 8999 }] }),
+    ]);
+  });
+
+  it(&#x27;rejects INSUFFICIENT_STOCK and leaves every product untouched&#x27;, async () =&gt; {
+    const e = created([{ productId: KEYBOARD, quantity: 1 }, { productId: MONITOR, quantity: 2 }]);
+    await service.handle(e);
+    expect(await stockOf(KEYBOARD)).toBe(10);
+    expect(await stockOf(MONITOR)).toBe(1);
+    expect(await replies(e.orderId)).toEqual([expect.objectContaining({ type: &#x27;stock.rejected&#x27;, reason: &#x27;INSUFFICIENT_STOCK&#x27; })]);
+  });
+
+  it(&#x27;rejects UNKNOWN_PRODUCT&#x27;, async () =&gt; {
+    const e = created([{ productId: &#x27;99999999-9999-4999-8999-999999999999&#x27;, quantity: 1 }]);
+    await service.handle(e);
+    expect(await replies(e.orderId)).toEqual([expect.objectContaining({ type: &#x27;stock.rejected&#x27;, reason: &#x27;UNKNOWN_PRODUCT&#x27; })]);
+  });
+
+  it(&#x27;processes a redelivered event once&#x27;, async () =&gt; {
+    const e = created([{ productId: MOUSE, quantity: 2 }]);
+    await service.handle(e);
+    await service.handle(e);
+    expect(await stockOf(MOUSE)).toBe(3);
+    expect(await replies(e.orderId)).toHaveLength(1);
+  });
+
+  it(&#x27;sums a product that appears twice in one event into one reservation&#x27;, async () =&gt; {
+    const e = created([{ productId: MOUSE, quantity: 1 }, { productId: MOUSE, quantity: 2 }]);
+    await service.handle(e);
+    expect(await stockOf(MOUSE)).toBe(2);
+    expect(await reservationRows(e.orderId)).toEqual([{ product_id: MOUSE, quantity: 3, status: &#x27;ACTIVE&#x27; }]);
+  });
+
+  it(&#x27;never oversells: two concurrent orders for the last monitor, exactly one wins&#x27;, async () =&gt; {
+    const a = created([{ productId: MONITOR, quantity: 1 }]);
+    const b = created([{ productId: MONITOR, quantity: 1 }]);
+    await Promise.all([service.handle(a), service.handle(b)]);
+    expect(await stockOf(MONITOR)).toBe(0);
+    const types = [...(await replies(a.orderId)), ...(await replies(b.orderId))].map((r: { type: string }) =&gt; r.type).sort();
+    expect(types).toEqual([&#x27;stock.rejected&#x27;, &#x27;stock.reserved&#x27;]);
+  });
+
+  it(&#x27;releases on order.cancelled, once, even if redelivered&#x27;, async () =&gt; {
+    const e = created([{ productId: KEYBOARD, quantity: 4 }]);
+    await service.handle(e);
+    const c = cancelled(e.orderId);
+    await service.handle(c);
+    await service.handle(c);
+    expect(await stockOf(KEYBOARD)).toBe(10);
+    expect(await reservationRows(e.orderId)).toEqual([{ product_id: KEYBOARD, quantity: 4, status: &#x27;RELEASED&#x27; }]);
+  });
+
+  it(&#x27;treats a cancel for an order it never reserved as a no-op&#x27;, async () =&gt; {
+    await expect(service.handle(cancelled(randomUUID()))).resolves.toBeUndefined();
+  });
+});</code></pre>
+<ul><li>[ ] <strong>Step 2: Run it to verify it fails</strong></li></ul>
+<p>Run: <code>npm run test:int -- test/int/inventory</code> Expected: FAIL, <code>Cannot find module '../../apps/inventory/src/data-source'</code>.</p>
+<ul><li>[ ] <strong>Step 3: Implement config, entities, migration, data source</strong></li></ul>
+<p><code>apps/inventory/src/config.ts</code>:</p>
+<pre><code>/** Read when a module initialises, never at import time, and every value has a local default. */
+export function inventoryConfig() {
+  return {
+    databaseUrl: process.env.INVENTORY_DATABASE_URL ?? &#x27;postgres://orderflow:orderflow@localhost:5432/inventory&#x27;,
+    kafkaBrokers: (process.env.KAFKA_BROKERS ?? &#x27;localhost:9094&#x27;).split(&#x27;,&#x27;),
+    outboxIntervalMs: Number(process.env.OUTBOX_INTERVAL_MS ?? 500),
+  };
+}</code></pre>
+<p><code>apps/inventory/src/stock/product.entity.ts</code>:</p>
+<pre><code>import { Column, Entity, PrimaryColumn } from &#x27;typeorm&#x27;;
+
+@Entity(&#x27;products&#x27;)
+export class Product {
+  @PrimaryColumn(&#x27;uuid&#x27;)
+  id!: string;
+
+  @Column(&#x27;varchar&#x27;, { length: 32, unique: true })
+  sku!: string;
+
+  @Column(&#x27;varchar&#x27;, { length: 120 })
+  name!: string;
+
+  @Column(&#x27;integer&#x27;, { name: &#x27;price_cents&#x27; })
+  priceCents!: number;
+
+  @Column(&#x27;integer&#x27;, { name: &#x27;stock_available&#x27; })
+  stockAvailable!: number;
+}</code></pre>
+<p><code>apps/inventory/src/stock/reservation.entity.ts</code>:</p>
+<pre><code>import { Column, Entity, PrimaryGeneratedColumn } from &#x27;typeorm&#x27;;
+
+@Entity(&#x27;reservations&#x27;)
+export class Reservation {
+  @PrimaryGeneratedColumn(&#x27;uuid&#x27;)
+  id!: string;
+
+  @Column(&#x27;uuid&#x27;, { name: &#x27;order_id&#x27; })
+  orderId!: string;
+
+  @Column(&#x27;uuid&#x27;, { name: &#x27;product_id&#x27; })
+  productId!: string;
+
+  @Column(&#x27;integer&#x27;)
+  quantity!: number;
+
+  @Column(&#x27;varchar&#x27;, { length: 16 })
+  status!: &#x27;ACTIVE&#x27; | &#x27;RELEASED&#x27;;
+}</code></pre>
+<p><code>apps/inventory/src/migrations/1728300000001-init-inventory.ts</code>:</p>
+<pre><code>import { DROP_MESSAGING_TABLES_SQL, MESSAGING_TABLES_SQL } from &#x27;@app/messaging&#x27;;
+import { MigrationInterface, QueryRunner } from &#x27;typeorm&#x27;;
+import { SEED_PRODUCTS } from &#x27;../stock/seed&#x27;;
+
+export class InitInventory1728300000001 implements MigrationInterface {
+  name = &#x27;InitInventory1728300000001&#x27;;
+
+  async up(q: QueryRunner): Promise&lt;void&gt; {
+    await q.query(`
+      CREATE TABLE products (
+        id              uuid PRIMARY KEY,
+        sku             varchar(32)  NOT NULL UNIQUE,
+        name            varchar(120) NOT NULL,
+        price_cents     integer NOT NULL CHECK (price_cents &gt;= 0),
+        stock_available integer NOT NULL CHECK (stock_available &gt;= 0)
+      );
+      CREATE TABLE reservations (
+        id         uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+        order_id   uuid NOT NULL,
+        product_id uuid NOT NULL REFERENCES products(id),
+        quantity   integer NOT NULL CHECK (quantity &gt; 0),
+        status     varchar(16) NOT NULL
+      );
+      CREATE INDEX reservations_order_idx ON reservations (order_id);
+    `);
+    await q.query(MESSAGING_TABLES_SQL);
+    for (const p of SEED_PRODUCTS) {
+      await q.query(&#x27;INSERT INTO products (id, sku, name, price_cents, stock_available) VALUES ($1, $2, $3, $4, $5)&#x27;, [
+        p.id,
+        p.sku,
+        p.name,
+        p.priceCents,
+        p.stock,
+      ]);
+    }
+  }
+
+  async down(q: QueryRunner): Promise&lt;void&gt; {
+    await q.query(DROP_MESSAGING_TABLES_SQL);
+    await q.query(&#x27;DROP TABLE reservations; DROP TABLE products;&#x27;);
+  }
+}</code></pre>
+<p><code>apps/inventory/src/data-source.ts</code>:</p>
+<pre><code>import { OutboxMessage, ProcessedEvent } from &#x27;@app/messaging&#x27;;
+import { DataSourceOptions } from &#x27;typeorm&#x27;;
+import { InitInventory1728300000001 } from &#x27;./migrations/1728300000001-init-inventory&#x27;;
+import { Product } from &#x27;./stock/product.entity&#x27;;
+import { Reservation } from &#x27;./stock/reservation.entity&#x27;;
+
+export function inventoryDataSourceOptions(url: string): DataSourceOptions {
+  return {
+    type: &#x27;postgres&#x27;,
+    url,
+    entities: [Product, Reservation, OutboxMessage, ProcessedEvent],
+    migrations: [InitInventory1728300000001],
+    migrationsRun: true,
+    synchronize: false,
+  };
+}</code></pre>
+<ul><li>[ ] <strong>Step 4: Implement <code>ReservationService</code></strong></li></ul>
+<p><code>apps/inventory/src/stock/reservation.service.ts</code>:</p>
+<pre><code>import { EventTypes, newEnvelope, OrderCancelled, OrderCreated, OrderEvent, StockEvent } from &#x27;@app/contracts&#x27;;
+import { enqueue, markProcessed } from &#x27;@app/messaging&#x27;;
+import { Injectable } from &#x27;@nestjs/common&#x27;;
+import { DataSource } from &#x27;typeorm&#x27;;
+import { Product } from &#x27;./product.entity&#x27;;
+import { Reservation } from &#x27;./reservation.entity&#x27;;
+import { aggregate, decideReservation } from &#x27;./stock&#x27;;
+
+@Injectable()
+export class ReservationService {
+  constructor(private readonly dataSource: DataSource) {}
+
+  /** Consumer handler for order-events. */
+  async handle(event: OrderEvent): Promise&lt;void&gt; {
+    switch (event.type) {
+      case EventTypes.OrderCreated:
+        return this.reserve(event);
+      case EventTypes.OrderCancelled:
+        return this.release(event);
+      case EventTypes.OrderPaid:
+        return; // nothing to do: the stock was already taken at reservation
+    }
+  }
+
+  /** Locks the product rows in id order (no deadlocks), decides, applies, and queues the reply — all in one transaction. */
+  async reserve(event: OrderCreated): Promise&lt;void&gt; {
+    await this.dataSource.transaction(async (m) =&gt; {
+      if (!(await markProcessed(m, event.eventId))) return;
+      const items = aggregate(event.items);
+      const products = await m
+        .createQueryBuilder(Product, &#x27;p&#x27;)
+        .where(&#x27;p.id IN (:...ids)&#x27;, { ids: items.map((i) =&gt; i.productId) })
+        .orderBy(&#x27;p.id&#x27;, &#x27;ASC&#x27;)
+        .setLock(&#x27;pessimistic_write&#x27;)
+        .getMany();
+      const decision = decideReservation(items, new Map(products.map((p) =&gt; [p.id, p])));
+
+      let reply: StockEvent;
+      if (decision.ok) {
+        for (const i of items) {
+          await m.decrement(Product, { id: i.productId }, &#x27;stockAvailable&#x27;, i.quantity);
+          await m.insert(Reservation, { orderId: event.orderId, productId: i.productId, quantity: i.quantity, status: &#x27;ACTIVE&#x27; });
+        }
+        reply = { ...newEnvelope(event.orderId), type: EventTypes.StockReserved, lines: decision.lines };
+      } else {
+        reply = { ...newEnvelope(event.orderId), type: EventTypes.StockRejected, reason: decision.reason };
+      }
+      await enqueue(m, reply);
+    });
+  }
+
+  async release(event: OrderCancelled): Promise&lt;void&gt; {
+    await this.dataSource.transaction(async (m) =&gt; {
+      if (!(await markProcessed(m, event.eventId))) return;
+      const active = await m.find(Reservation, {
+        where: { orderId: event.orderId, status: &#x27;ACTIVE&#x27; },
+        order: { productId: &#x27;ASC&#x27; },
+        lock: { mode: &#x27;pessimistic_write&#x27; },
+      });
+      for (const r of active) {
+        await m.increment(Product, { id: r.productId }, &#x27;stockAvailable&#x27;, r.quantity);
+        r.status = &#x27;RELEASED&#x27;;
+      }
+      await m.save(active);
+    });
+  }
+}</code></pre>
+<ul><li>[ ] <strong>Step 5: Run the tests</strong></li></ul>
+<p>Run: <code>npm run test:int -- test/int/inventory &amp;&amp; npm run lint &amp;&amp; npm run typecheck</code> Expected: PASS, including the concurrency test.</p>
+<ul><li>[ ] <strong>Step 6: Commit</strong></li></ul>
+<pre><code>git add -A
+git commit -m &quot;feat(inventory): row-locked reservations, release, idempotent handlers, reply outbox&quot;</code></pre>
+<hr>
+<h3 id="task-9-inventory-nest-module-and-entry-point">Task 9: Inventory Nest module and entry point</h3>
+<p><strong>Files:</strong></p>
+<ul><li>Create: <code>apps/inventory/src/messaging.lifecycle.ts</code>, <code>app.module.ts</code>, <code>main.ts</code></li></ul>
+<p><strong>Interfaces:</strong></p>
+<ul><li>Consumes: <code>ReservationService</code>, <code>inventoryConfig</code>, <code>inventoryDataSourceOptions</code> (Task 8); messaging (Tasks 2, 4).</li><li>Produces: <code>InventoryAppModule</code> (no HTTP). On bootstrap: ensure topics, start the outbox publisher and the <code>order-events</code> consumer (group <code>inventory</code>); stop both before shutdown.</li></ul>
+<ul><li>[ ] <strong>Step 1: Implement</strong></li></ul>
+<p><code>apps/inventory/src/messaging.lifecycle.ts</code>:</p>
+<pre><code>import { OrderEvent, Topics } from &#x27;@app/contracts&#x27;;
+import { createKafka, ensureTopics, EventConsumer, OutboxPublisher } from &#x27;@app/messaging&#x27;;
+import { BeforeApplicationShutdown, Injectable, Logger, OnApplicationBootstrap } from &#x27;@nestjs/common&#x27;;
+import { DataSource } from &#x27;typeorm&#x27;;
+import { inventoryConfig } from &#x27;./config&#x27;;
+import { ReservationService } from &#x27;./stock/reservation.service&#x27;;
+
+@Injectable()
+export class InventoryMessaging implements OnApplicationBootstrap, BeforeApplicationShutdown {
+  private publisher?: OutboxPublisher;
+  private consumer?: EventConsumer;
+
+  constructor(
+    private readonly dataSource: DataSource,
+    private readonly reservations: ReservationService,
+  ) {}
+
+  async onApplicationBootstrap(): Promise&lt;void&gt; {
+    const cfg = inventoryConfig();
+    const kafka = createKafka(&#x27;inventory&#x27;, cfg.kafkaBrokers);
+    await ensureTopics(kafka);
+    this.publisher = new OutboxPublisher(this.dataSource, kafka.producer({ maxInFlightRequests: 1 }), {
+      intervalMs: cfg.outboxIntervalMs,
+      logger: new Logger(&#x27;InventoryOutbox&#x27;),
+    });
+    await this.publisher.start();
+    this.consumer = new EventConsumer({
+      kafka,
+      groupId: &#x27;inventory&#x27;,
+      topic: Topics.OrderEvents,
+      handle: (e) =&gt; this.reservations.handle(e as OrderEvent), // parseEvent guarantees order-events carry order events
+      logger: new Logger(&#x27;OrderEventsConsumer&#x27;),
+    });
+    await this.consumer.start();
+  }
+
+  async beforeApplicationShutdown(): Promise&lt;void&gt; {
+    await this.consumer?.stop();
+    await this.publisher?.stop();
+  }
+}</code></pre>
+<p><code>apps/inventory/src/app.module.ts</code>:</p>
+<pre><code>import { Module } from &#x27;@nestjs/common&#x27;;
+import { TypeOrmModule } from &#x27;@nestjs/typeorm&#x27;;
+import { inventoryConfig } from &#x27;./config&#x27;;
+import { inventoryDataSourceOptions } from &#x27;./data-source&#x27;;
+import { InventoryMessaging } from &#x27;./messaging.lifecycle&#x27;;
+import { ReservationService } from &#x27;./stock/reservation.service&#x27;;
+
+@Module({
+  imports: [TypeOrmModule.forRootAsync({ useFactory: () =&gt; inventoryDataSourceOptions(inventoryConfig().databaseUrl) })],
+  providers: [ReservationService, InventoryMessaging],
+})
+export class InventoryAppModule {}</code></pre>
+<p><code>apps/inventory/src/main.ts</code>:</p>
+<pre><code>import { NestFactory } from &#x27;@nestjs/core&#x27;;
+import { InventoryAppModule } from &#x27;./app.module&#x27;;
+
+async function bootstrap(): Promise&lt;void&gt; {
+  // No HTTP: inventory only listens to Kafka.
+  const app = await NestFactory.createApplicationContext(InventoryAppModule);
+  app.enableShutdownHooks();
+}
+void bootstrap();</code></pre>
+<ul><li>[ ] <strong>Step 2: Build both apps</strong></li></ul>
+<p>Run: <code>npm run lint &amp;&amp; npm run typecheck &amp;&amp; npm run build</code> Expected: <code>dist/apps/orders/main.js</code> and <code>dist/apps/inventory/main.js</code> exist. (The running system is proven by Task 10's e2e suite.)</p>
+<ul><li>[ ] <strong>Step 3: Commit</strong></li></ul>
+<pre><code>git add -A
+git commit -m &quot;feat(inventory): Nest application context with consumer and outbox&quot;</code></pre>
+<hr>
+<h3 id="task-10-end-to-end-suite-postgresql-kafka-both-services">Task 10: End-to-end suite (PostgreSQL + Kafka + both services)</h3>
+<p><strong>Files:</strong></p>
+<ul><li>Create: <code>test/support/kafka.ts</code>, <code>test/support/wait-for.ts</code></li><li>Test: <code>test/e2e/orderflow.e2e-spec.ts</code></li></ul>
+<p><strong>Interfaces:</strong></p>
+<ul><li>Consumes: <code>OrdersAppModule</code> (Task 6), <code>InventoryAppModule</code> (Task 9), <code>SEED_PRODUCTS</code> (Task 7), <code>startPostgres</code> (Task 4), <code>createKafka</code> (Task 2), <code>Topics</code>, <code>dlqTopic</code> (Task 1).</li><li>Produces: <code>startKafka(): Promise&lt;{ container: StartedKafkaContainer; brokers: string[] }&gt;</code>, <code>waitFor&lt;T&gt;(read: () =&gt; Promise&lt;T&gt;, done: (v: T) =&gt; boolean, timeoutMs?: number): Promise&lt;T&gt;</code></li></ul>
+<ul><li>[ ] <strong>Step 1: Write the support files</strong></li></ul>
+<p><code>test/support/kafka.ts</code>:</p>
+<pre><code>import { KafkaContainer, StartedKafkaContainer } from &#x27;@testcontainers/kafka&#x27;;
+
+/** Single-node Kafka in KRaft mode (no ZooKeeper). */
+export async function startKafka(): Promise&lt;{ container: StartedKafkaContainer; brokers: string[] }&gt; {
+  const container = await new KafkaContainer(&#x27;confluentinc/cp-kafka:7.7.1&#x27;).withKraft().start();
+  // The Testcontainers Kafka module advertises the host listener on container port 9093.
+  return { container, brokers: [`${container.getHost()}:${container.getMappedPort(9093)}`] };
+}</code></pre>
+<p>If the installed <code>@testcontainers/kafka</code> version documents a different host port or a different KRaft method name, follow its README; the rest of the suite only needs <code>brokers</code>.</p>
+<p><code>test/support/wait-for.ts</code>:</p>
+<pre><code>/** Polls until `done(value)` is true. Eventual consistency without fixed sleeps. */
+export async function waitFor&lt;T&gt;(read: () =&gt; Promise&lt;T&gt;, done: (v: T) =&gt; boolean, timeoutMs = 30_000): Promise&lt;T&gt; {
+  const deadline = Date.now() + timeoutMs;
+  let last: T | undefined;
+  while (Date.now() &lt; deadline) {
+    last = await read();
+    if (done(last)) return last;
+    await new Promise((r) =&gt; setTimeout(r, 200));
+  }
+  throw new Error(`waitFor timed out after ${timeoutMs} ms; last value: ${JSON.stringify(last)}`);
+}</code></pre>
+<ul><li>[ ] <strong>Step 2: Write the e2e suite</strong></li></ul>
+<p><code>test/e2e/orderflow.e2e-spec.ts</code>:</p>
+<pre><code>import { dlqTopic, EventTypes, newEnvelope, Topics } from &#x27;@app/contracts&#x27;;
+import { createKafka } from &#x27;@app/messaging&#x27;;
+import { INestApplication, INestApplicationContext } from &#x27;@nestjs/common&#x27;;
+import { NestFactory } from &#x27;@nestjs/core&#x27;;
+import { StartedKafkaContainer } from &#x27;@testcontainers/kafka&#x27;;
+import { StartedPostgreSqlContainer } from &#x27;@testcontainers/postgresql&#x27;;
+import { Kafka, Producer } from &#x27;kafkajs&#x27;;
+import { randomUUID } from &#x27;node:crypto&#x27;;
+import { Client } from &#x27;pg&#x27;;
+import request from &#x27;supertest&#x27;;
+import { InventoryAppModule } from &#x27;../../apps/inventory/src/app.module&#x27;;
+import { SEED_PRODUCTS } from &#x27;../../apps/inventory/src/stock/seed&#x27;;
+import { OrdersAppModule } from &#x27;../../apps/orders/src/app.module&#x27;;
+import { startKafka } from &#x27;../support/kafka&#x27;;
+import { startPostgres } from &#x27;../support/postgres&#x27;;
+import { waitFor } from &#x27;../support/wait-for&#x27;;
+
+const [KEYBOARD, MOUSE, MONITOR] = SEED_PRODUCTS.map((p) =&gt; p.id);
+type Gql = { data?: Record&lt;string, unknown&gt; | null; errors?: { message: string; extensions?: { code?: string } }[] };
+type OrderView = { id: string; status: string; totalCents: number | null; rejectionReason: string | null };
+
+describe(&#x27;orderflow end to end&#x27;, () =&gt; {
+  let pg: StartedPostgreSqlContainer;
+  let kafkaContainer: StartedKafkaContainer;
+  let kafka: Kafka;
+  let rawProducer: Producer;
+  let orders: INestApplication;
+  let inventory: INestApplicationContext;
+  let inventoryDb: Client;
+
+  const gql = async (query: string, variables?: object): Promise&lt;Gql&gt; =&gt;
+    (await request(orders.getHttpServer()).post(&#x27;/graphql&#x27;).send({ query, variables })).body;
+  const createOrder = async (items: { productId: string; quantity: number }[]): Promise&lt;string&gt; =&gt; {
+    const res = await gql(`mutation($items: [OrderItemInput!]!) { createOrder(items: $items) { id } }`, { items });
+    expect(res.errors).toBeUndefined();
+    return (res.data?.createOrder as { id: string }).id;
+  };
+  const readOrder = async (id: string): Promise&lt;OrderView&gt; =&gt;
+    (await gql(`query($id: ID!) { order(id: $id) { id status totalCents rejectionReason } }`, { id })).data?.order as OrderView;
+  const waitForStatus = (id: string, status: string) =&gt; waitFor(() =&gt; readOrder(id), (o) =&gt; o?.status === status);
+  const stockOf = async (id: string): Promise&lt;number&gt; =&gt;
+    (await inventoryDb.query(&#x27;SELECT stock_available FROM products WHERE id = $1&#x27;, [id])).rows[0].stock_available;
+
+  beforeAll(async () =&gt; {
+    const [p, k] = await Promise.all([startPostgres(), startKafka()]);
+    pg = p.container;
+    kafkaContainer = k.container;
+    // No .env anywhere: everything comes from these variables, read when the modules initialise.
+    process.env.ORDERS_DATABASE_URL = p.ordersUrl;
+    process.env.INVENTORY_DATABASE_URL = p.inventoryUrl;
+    process.env.KAFKA_BROKERS = k.brokers.join(&#x27;,&#x27;);
+    process.env.OUTBOX_INTERVAL_MS = &#x27;100&#x27;;
+
+    inventory = await NestFactory.createApplicationContext(InventoryAppModule, { logger: [&#x27;error&#x27;, &#x27;warn&#x27;] });
+    orders = await NestFactory.create(OrdersAppModule, { logger: [&#x27;error&#x27;, &#x27;warn&#x27;] });
+    await orders.init();
+
+    kafka = createKafka(&#x27;e2e&#x27;, k.brokers);
+    rawProducer = kafka.producer();
+    await rawProducer.connect();
+    inventoryDb = new Client({ connectionString: p.inventoryUrl });
+    await inventoryDb.connect();
+  });
+
+  afterAll(async () =&gt; {
+    await inventoryDb?.end();
+    await rawProducer?.disconnect();
+    await orders?.close();
+    await inventory?.close();
+    await kafkaContainer?.stop();
+    await pg?.stop();
+  });
+
+  it(&#x27;1. reserves stock for a new order, then takes payment&#x27;, async () =&gt; {
+    const before = await stockOf(KEYBOARD);
+    const id = await createOrder([{ productId: KEYBOARD, quantity: 2 }]);
+    const reserved = await waitForStatus(id, &#x27;RESERVED&#x27;);
+    expect(reserved.totalCents).toBe(2 * 8999);
+    expect(await stockOf(KEYBOARD)).toBe(before - 2);
+
+    const paid = await gql(`mutation($id: ID!) { payOrder(id: $id) { status } }`, { id });
+    expect(paid.data?.payOrder).toEqual({ status: &#x27;PAID&#x27; });
+  });
+
+  let rejectedId = &#x27;&#x27;;
+  it(&#x27;2. rejects an order larger than the stock, leaving stock unchanged&#x27;, async () =&gt; {
+    const before = await stockOf(MONITOR);
+    rejectedId = await createOrder([{ productId: MONITOR, quantity: before + 1 }]);
+    const rejected = await waitForStatus(rejectedId, &#x27;REJECTED&#x27;);
+    expect(rejected.rejectionReason).toBe(&#x27;INSUFFICIENT_STOCK&#x27;);
+    expect(await stockOf(MONITOR)).toBe(before);
+  });
+
+  it(&#x27;3. releases stock when a reserved order is cancelled&#x27;, async () =&gt; {
+    const before = await stockOf(MOUSE);
+    const id = await createOrder([{ productId: MOUSE, quantity: 2 }]);
+    await waitForStatus(id, &#x27;RESERVED&#x27;);
+    expect(await stockOf(MOUSE)).toBe(before - 2);
+
+    await gql(`mutation($id: ID!) { cancelOrder(id: $id) { status } }`, { id });
+    await waitFor(() =&gt; stockOf(MOUSE), (s) =&gt; s === before);
+  });
+
+  it(&#x27;4. reserves stock once when the same order.created is delivered twice&#x27;, async () =&gt; {
+    const before = await stockOf(KEYBOARD);
+    const id = await createOrder([{ productId: KEYBOARD, quantity: 1 }]);
+    await waitForStatus(id, &#x27;RESERVED&#x27;);
+
+    // Re-deliver the exact event the outbox already sent (same eventId), as Kafka may after a rebalance.
+    const ordersDb = new Client({ connectionString: process.env.ORDERS_DATABASE_URL });
+    await ordersDb.connect();
+    const { rows } = await ordersDb.query(`SELECT payload FROM outbox WHERE key = $1 AND payload-&gt;&gt;&#x27;type&#x27; = &#x27;order.created&#x27;`, [id]);
+    await ordersDb.end();
+    await rawProducer.send({ topic: Topics.OrderEvents, messages: [{ key: id, value: JSON.stringify(rows[0].payload) }] });
+
+    // Then cancel. Same key, same partition, so inventory handles the duplicate before the cancel.
+    await gql(`mutation($id: ID!) { cancelOrder(id: $id) { status } }`, { id });
+    const released = await waitFor(
+      async () =&gt; (await inventoryDb.query(&#x27;SELECT status FROM reservations WHERE order_id = $1&#x27;, [id])).rows,
+      (r) =&gt; r.length &gt; 0 &amp;&amp; r.every((x: { status: string }) =&gt; x.status === &#x27;RELEASED&#x27;),
+    );
+    expect(released).toHaveLength(1); // a second reservation would mean the duplicate was processed
+    expect(await stockOf(KEYBOARD)).toBe(before);
+  });
+
+  it(&#x27;5. dead-letters a malformed message and keeps processing the next orders&#x27;, async () =&gt; {
+    const poisonKey = randomUUID();
+    await rawProducer.send({ topic: Topics.OrderEvents, messages: [{ key: poisonKey, value: &#x27;definitely not json&#x27; }] });
+    // A well-formed event with a type that does not belong on this topic is a contract violation too.
+    await rawProducer.send({
+      topic: Topics.OrderEvents,
+      messages: [{ key: poisonKey, value: JSON.stringify({ ...newEnvelope(poisonKey), type: EventTypes.StockRejected, reason: &#x27;UNKNOWN_PRODUCT&#x27; }) }],
+    });
+
+    const id = await createOrder([{ productId: KEYBOARD, quantity: 1 }]);
+    await waitForStatus(id, &#x27;RESERVED&#x27;);
+
+    const dead: { original: string; attempts: number }[] = [];
+    const reader = kafka.consumer({ groupId: `dlq-reader-${randomUUID()}` });
+    await reader.connect();
+    await reader.subscribe({ topic: dlqTopic(Topics.OrderEvents), fromBeginning: true });
+    await reader.run({ eachMessage: async ({ message }) =&gt; void dead.push(JSON.parse(String(message.value))) });
+    try {
+      await waitFor(async () =&gt; dead.length, (n) =&gt; n &gt;= 2);
+    } finally {
+      await reader.disconnect();
+    }
+    expect(dead.map((d) =&gt; d.original)).toContain(&#x27;definitely not json&#x27;);
+    expect(dead.every((d) =&gt; d.attempts === 1)).toBe(true);
+  });
+
+  it(&#x27;6. refuses to pay a REJECTED order&#x27;, async () =&gt; {
+    const res = await gql(`mutation($id: ID!) { payOrder(id: $id) { status } }`, { id: rejectedId });
+    expect(res.errors?.[0]?.extensions?.code).toBe(&#x27;INVALID_STATE&#x27;);
+  });
+});</code></pre>
+<ul><li>[ ] <strong>Step 3: Run the e2e suite</strong></li></ul>
+<p>Run: <code>npm run test:e2e</code> Expected: 6 PASS. The first run pulls the Kafka image (about a minute). If scenario 1 times out, check the inventory logs for a broker connection error first: that means the Kafka host port in <code>test/support/kafka.ts</code> is wrong for the installed module version.</p>
+<ul><li>[ ] <strong>Step 4: Run everything once</strong></li></ul>
+<p>Run: <code>npm run lint &amp;&amp; npm run typecheck &amp;&amp; npm test</code> Expected: unit, int and e2e all PASS.</p>
+<ul><li>[ ] <strong>Step 5: Commit</strong></li></ul>
+<pre><code>git add -A
+git commit -m &quot;test(e2e): full flow over real PostgreSQL and Kafka: reserve, reject, release, dedupe, DLQ&quot;</code></pre>
+<hr>
+<h3 id="task-11-docker-images-and-docker-compose-up">Task 11: Docker images and <code>docker compose up</code></h3>
+<p><strong>Files:</strong></p>
+<ul><li>Create: <code>Dockerfile</code>, <code>.dockerignore</code>, <code>docker-compose.yml</code>, <code>docker/postgres-init.sql</code></li></ul>
+<p><strong>Interfaces:</strong></p>
+<ul><li>Consumes: <code>npm run build</code> output (<code>dist/apps/&lt;app&gt;/main.js</code>); env vars from Tasks 5 and 8.</li><li>Produces: <code>docker compose up --build --wait</code> runs postgres, kafka, orders (<code>localhost:3000</code>) and inventory; Kafka reachable from the host at <code>localhost:9094</code>.</li></ul>
+<ul><li>[ ] <strong>Step 1: Write the files</strong></li></ul>
+<p><code>Dockerfile</code>:</p>
+<pre><code>FROM node:22-alpine AS build
+WORKDIR /app
+COPY package*.json ./
+RUN npm ci
+COPY . .
+ARG APP
+RUN npx nest build ${APP}
+
+FROM node:22-alpine
+WORKDIR /app
+ENV NODE_ENV=production
+COPY package*.json ./
+RUN npm ci --omit=dev &amp;&amp; npm cache clean --force
+ARG APP
+COPY --from=build /app/dist/apps/${APP} ./dist
+USER node
+CMD [&quot;node&quot;, &quot;dist/main.js&quot;]</code></pre>
+<p><code>.dockerignore</code>:</p>
+<pre><code>node_modules
+dist
+coverage
+.git
+.env
+docs</code></pre>
+<p><code>docker/postgres-init.sql</code>:</p>
+<pre><code>-- The image creates the &quot;orders&quot; database from POSTGRES_DB; inventory gets its own database on the same server.
+CREATE DATABASE inventory;</code></pre>
+<p><code>docker-compose.yml</code>:</p>
+<pre><code>services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: orderflow
+      POSTGRES_PASSWORD: orderflow
+      POSTGRES_DB: orders
+    ports: [&quot;5432:5432&quot;]
+    volumes:
+      - ./docker/postgres-init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    healthcheck:
+      test: [&quot;CMD-SHELL&quot;, &quot;pg_isready -U orderflow -d orders&quot;]
+      interval: 2s
+      retries: 30
+
+  kafka:
+    image: apache/kafka:3.9.0
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENERS: INTERNAL://:9092,EXTERNAL://:9094,CONTROLLER://:9093
+      KAFKA_ADVERTISED_LISTENERS: INTERNAL://kafka:9092,EXTERNAL://localhost:9094
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: INTERNAL:PLAINTEXT,EXTERNAL:PLAINTEXT,CONTROLLER:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: INTERNAL
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+    ports: [&quot;9094:9094&quot;]
+    healthcheck:
+      test: [&quot;CMD-SHELL&quot;, &quot;/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 &gt; /dev/null 2&gt;&amp;1&quot;]
+      interval: 3s
+      retries: 40
+
+  orders:
+    build: { context: ., args: { APP: orders } }
+    environment:
+      ORDERS_DATABASE_URL: postgres://orderflow:orderflow@postgres:5432/orders
+      KAFKA_BROKERS: kafka:9092
+    ports: [&quot;3000:3000&quot;]
+    depends_on:
+      postgres: { condition: service_healthy }
+      kafka: { condition: service_healthy }
+    healthcheck:
+      test: [&quot;CMD-SHELL&quot;, &quot;wget -qO- http://localhost:3000/health || exit 1&quot;]
+      interval: 3s
+      retries: 30
+
+  inventory:
+    build: { context: ., args: { APP: inventory } }
+    environment:
+      INVENTORY_DATABASE_URL: postgres://orderflow:orderflow@postgres:5432/inventory
+      KAFKA_BROKERS: kafka:9092
+    depends_on:
+      postgres: { condition: service_healthy }
+      kafka: { condition: service_healthy }</code></pre>
+<ul><li>[ ] <strong>Step 2: Bring it up and place an order by hand</strong></li></ul>
+<p>Run:</p>
+<pre><code>docker compose up --build --wait
+curl -s localhost:3000/graphql -H &#x27;content-type: application/json&#x27; \
+  -d &#x27;{&quot;query&quot;:&quot;mutation { createOrder(items: [{productId: \&quot;11111111-1111-4111-8111-111111111111\&quot;, quantity: 1}]) { id status } }&quot;}&#x27;</code></pre>
+<p>Expected: <code>{"data":{"createOrder":{"id":"…","status":"PENDING"}}}</code>. Query that id a second later with <code>{ order(id: "…") { status totalCents } }</code> and expect <code>RESERVED</code> and <code>8999</code>.</p>
+<ul><li>[ ] <strong>Step 3: Tear down and commit</strong></li></ul>
+<pre><code>docker compose down -v
+git add -A
+git commit -m &quot;build: Dockerfile and docker-compose for the full system&quot;</code></pre>
+<hr>
+<h3 id="task-12-ci-and-readme">Task 12: CI and README</h3>
+<p><strong>Files:</strong></p>
+<ul><li>Create: <code>.github/workflows/ci.yml</code>, <code>README.md</code></li></ul>
+<p><strong>Interfaces:</strong></p>
+<ul><li>Consumes: npm scripts (Task 1), Compose (Task 11).</li><li>Produces: the CI badge and the document a reviewer reads first.</li></ul>
+<ul><li>[ ] <strong>Step 1: Write the workflow</strong></li></ul>
+<p><code>.github/workflows/ci.yml</code>:</p>
+<pre><code>name: CI
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 22, cache: npm }
+      - run: npm ci
+      - run: npm run lint
+      - run: npm run typecheck
+      - run: npm run test:unit -- --coverage
+      - run: npm run test:int
+      - run: npm run test:e2e
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with: { name: coverage, path: coverage }
+
+  compose-smoke:
+    # Proves the shipped containers start from a clean checkout, not just that the tests pass.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker compose up --build --wait
+      - name: Place an order
+        run: |
+          curl -sf localhost:3000/graphql -H &#x27;content-type: application/json&#x27; \
+            -d &#x27;{&quot;query&quot;:&quot;mutation { createOrder(items: [{productId: \&quot;11111111-1111-4111-8111-111111111111\&quot;, quantity: 1}]) { id } }&quot;}&#x27; \
+            | tee /tmp/out.json | grep -q &#x27;&quot;id&quot;&#x27;
+      - if: failure()
+        run: docker compose logs</code></pre>
+<ul><li>[ ] <strong>Step 2: Write the README</strong></li></ul>
+<p><code>README.md</code> (replace <code>lemmy-code</code> only if the GitHub owner differs):</p>
+<pre><code># orderflow
+
+[![CI](https://github.com/lemmy-code/orderflow/actions/workflows/ci.yml/badge.svg)](https://github.com/lemmy-code/orderflow/actions/workflows/ci.yml)
+
+Two NestJS services that process orders over Kafka: **orders** (GraphQL API) and **inventory** (stock). They never call
+each other; every state change and the event announcing it are committed together, then published by an outbox.
+</code></pre>
+<p>flowchart LR client([GraphQL client]) --&gt;|createOrder / payOrder / cancelOrder| orders subgraph orders service orders[orders API] --&gt; odb[(orders DB&lt;br/&gt;orders · outbox · processed_events)] end subgraph inventory service inv[inventory] --&gt; idb[(inventory DB&lt;br/&gt;products · reservations · outbox · processed_events)] end odb -. outbox publisher .-&gt; oe[[order-events]] oe --&gt; inv idb -. outbox publisher .-&gt; se[[stock-events]] se --&gt; orders oe -. after 3 failed attempts .-&gt; oedlq[[order-events.dlq]] se -. after 3 failed attempts .-&gt; sedlq[[stock-events.dlq]]</p>
+<pre><code>
+## Run it
+</code></pre>
+<p>docker compose up --build --wait</p>
+<pre><code>
+GraphQL at &lt;http://localhost:3000/graphql&gt;. Seeded products:
+
+| Product | id | Price | Stock |
+|---|---|---|---|
+| Mechanical keyboard | `11111111-1111-4111-8111-111111111111` | 89.99 | 10 |
+| Wireless mouse | `22222222-2222-4222-8222-222222222222` | 29.99 | 5 |
+| 27-inch monitor | `33333333-3333-4333-8333-333333333333` | 249.99 | 1 |
+</code></pre>
+<p>mutation { createOrder(items: [{ productId: "11111111-1111-4111-8111-111111111111", quantity: 2 }]) { id status } } query    { order(id: "&lt;id&gt;") { status totalCents items { productId quantity unitPriceCents } } } mutation { payOrder(id: "&lt;id&gt;") { status } }</p>
+<pre><code>
+An order starts `PENDING`, becomes `RESERVED` or `REJECTED` (with a reason) once inventory answers, then `PAID` or
+`CANCELLED`. Errors carry `extensions.code`: `BAD_USER_INPUT`, `NOT_FOUND` or `INVALID_STATE`.
+
+## Design decisions
+
+- **Transactional outbox.** The order row and its `order.created` event are written in one transaction; a publisher
+  loop sends unsent rows to Kafka. A crash can delay an event but never lose one or invent one. Inventory replies
+  through its own outbox for the same reason.
+- **Idempotent consumers.** Kafka delivers at least once. Each handler records the event id in `processed_events` in
+  the same transaction as its change, so a redelivery is a no-op.
+- **One topic per stream, keyed by order id.** `order.created` and `order.cancelled` share `order-events`, so Kafka
+  keeps them in order for each order.
+- **No overselling.** Inventory locks product rows (`SELECT … FOR UPDATE`, in id order to avoid deadlocks) before it
+  checks and decrements stock.
+- **Dead-letter topics.** A failing message is retried 3 times with backoff, then moved to `&lt;topic&gt;.dlq` with the error,
+  so one bad message never blocks a partition. Invalid payloads skip the retries.
+- **No config at import time.** Every env var is read when its module starts and has a local default. CI runs from a
+  clean checkout with no `.env`.
+
+## Testing strategy
+
+| Layer | Question it answers | Runs against | Command |
+|---|---|---|---|
+| Unit | Is the logic right? (state machine, stock rules, retry policy, validation, contracts) | nothing | `npm run test:unit` |
+| Integration | Do the pieces work with a real database? (atomic outbox, row locks under concurrency, duplicate events) | PostgreSQL (Testcontainers) | `npm run test:int` |
+| End to end | Does the system work? Both services, real Kafka: reserve, reject, release, duplicate delivery, poison message → DLQ | PostgreSQL + Kafka (Testcontainers) | `npm run test:e2e` |
+
+CI runs lint, typecheck and all three layers on every push, and a second job boots the Compose stack and places an
+order. Docker must be running to run the integration and e2e tests locally.
+
+## Stack
+
+TypeScript · NestJS · GraphQL (Apollo, code-first) · PostgreSQL · TypeORM · Kafka (KafkaJS) · Jest · Supertest ·
+Testcontainers · Docker Compose · GitHub Actions</code></pre>
+<ul><li>[ ] <strong>Step 3: Verify from a clean checkout, like CI will</strong></li></ul>
+<p>Run:</p>
+<pre><code>rm -rf /tmp/orderflow-check &amp;&amp; git clone -q . /tmp/orderflow-check &amp;&amp; cd /tmp/orderflow-check \
+  &amp;&amp; npm ci &amp;&amp; npm run lint &amp;&amp; npm run typecheck &amp;&amp; npm test</code></pre>
+<p>Expected: everything passes in the fresh clone (no <code>.env</code>, no uncommitted files). Then <code>cd ~/Documents/GitHub/orderflow &amp;&amp; rm -rf /tmp/orderflow-check</code>.</p>
+<ul><li>[ ] <strong>Step 4: Commit</strong></li></ul>
+<pre><code>git add -A
+git commit -m &quot;ci: test and compose-smoke workflows; docs: README with architecture and testing strategy&quot;</code></pre>
+<p>Do not push. Creating the public GitHub repo and pushing is the user's call.</p></main></body></html>
