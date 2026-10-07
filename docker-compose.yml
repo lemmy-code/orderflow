@@ -1,3 +1,5 @@
+# Local development only. Ports are bound to 127.0.0.1 so nothing is reachable from the network,
+# and the passwords below are throwaway defaults for this machine, not secrets.
 services:
   postgres:
     image: postgres:16-alpine
@@ -5,7 +7,7 @@ services:
       POSTGRES_USER: orderflow
       POSTGRES_PASSWORD: orderflow
       POSTGRES_DB: orders
-    ports: ["5432:5432"]
+    ports: ["127.0.0.1:5432:5432"]
     volumes:
       - ./docker/postgres-init.sql:/docker-entrypoint-initdb.d/init.sql:ro
     healthcheck:
@@ -28,7 +30,7 @@ services:
       KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
       KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
       KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
-    ports: ["9094:9094"]
+    ports: ["127.0.0.1:9094:9094"]
     healthcheck:
       test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 > /dev/null 2>&1"]
       interval: 3s
@@ -37,9 +39,9 @@ services:
   orders:
     build: { context: ., args: { APP: orders } }
     environment:
-      ORDERS_DATABASE_URL: postgres://orderflow:orderflow@postgres:5432/orders
+      ORDERS_DATABASE_URL: postgres://orders_app:orders_app_local@postgres:5432/orders
       KAFKA_BROKERS: kafka:9092
-    ports: ["3000:3000"]
+    ports: ["127.0.0.1:3000:3000"]
     depends_on:
       postgres: { condition: service_healthy }
       kafka: { condition: service_healthy }
@@ -51,7 +53,7 @@ services:
   inventory:
     build: { context: ., args: { APP: inventory } }
     environment:
-      INVENTORY_DATABASE_URL: postgres://orderflow:orderflow@postgres:5432/inventory
+      INVENTORY_DATABASE_URL: postgres://inventory_app:inventory_app_local@postgres:5432/inventory
       KAFKA_BROKERS: kafka:9092
     depends_on:
       postgres: { condition: service_healthy }

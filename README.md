@@ -28,7 +28,11 @@ flowchart LR
 docker compose up --build --wait
 ```
 
-GraphQL at <http://localhost:3000/graphql>. Seeded products:
+GraphQL at <http://localhost:3000/graphql>. The Compose file is for local development: every port is bound to
+`127.0.0.1`, each service connects with its own database login that can only open its own database, and the
+passwords in it are throwaway local defaults, not secrets.
+
+Seeded products:
 
 | Product | id | Price | Stock |
 |---|---|---|---|
