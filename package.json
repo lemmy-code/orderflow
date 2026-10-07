@@ -4,7 +4,7 @@
   "private": true,
   "license": "MIT",
   "engines": {
-    "node": ">=22"
+    "node": ">=24.9"
   },
   "scripts": {
     "build": "nest build orders && nest build inventory",
@@ -12,9 +12,9 @@
     "start:inventory": "nest start inventory --watch",
     "lint": "eslint .",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "test:unit": "jest --selectProjects unit",
-    "test:int": "jest --selectProjects int --runInBand",
-    "test:e2e": "jest --selectProjects e2e --runInBand",
+    "test:unit": "NODE_OPTIONS=--experimental-vm-modules jest --selectProjects unit",
+    "test:int": "NODE_OPTIONS=--experimental-vm-modules jest --selectProjects int --runInBand",
+    "test:e2e": "NODE_OPTIONS=--experimental-vm-modules jest --selectProjects e2e --runInBand",
     "test": "npm run test:unit && npm run test:int && npm run test:e2e"
   },
   "dependencies": {
