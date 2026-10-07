@@ -1,0 +1,55 @@
+{
+  "name": "orderflow",
+  "version": "0.1.0",
+  "private": true,
+  "license": "MIT",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "build": "nest build orders && nest build inventory",
+    "start:orders": "nest start orders --watch",
+    "start:inventory": "nest start inventory --watch",
+    "lint": "eslint .",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test:unit": "jest --selectProjects unit",
+    "test:int": "jest --selectProjects int --runInBand",
+    "test:e2e": "jest --selectProjects e2e --runInBand",
+    "test": "npm run test:unit && npm run test:int && npm run test:e2e"
+  },
+  "dependencies": {
+    "@apollo/server": "^5.5.1",
+    "@nestjs/apollo": "^14.0.3",
+    "@nestjs/common": "^12.1.2",
+    "@nestjs/core": "^12.1.2",
+    "@nestjs/graphql": "^14.0.3",
+    "@nestjs/platform-express": "^12.1.2",
+    "@nestjs/typeorm": "^12.0.2",
+    "graphql": "^16.14.2",
+    "kafkajs": "^2.2.4",
+    "pg": "^8.23.1",
+    "reflect-metadata": "^0.2.2",
+    "rxjs": "^7.8.2",
+    "typeorm": "^1.1.1"
+  },
+  "devDependencies": {
+    "@nestjs/cli": "^12.0.8",
+    "@nestjs/schematics": "^12.0.0",
+    "@nestjs/testing": "^12.1.2",
+    "@testcontainers/kafka": "^12.2.0",
+    "@testcontainers/postgresql": "^12.2.0",
+    "@types/jest": "^30.0.0",
+    "@types/node": "^26.6.4",
+    "@types/pg": "^8.23.1",
+    "@types/supertest": "^7.2.1",
+    "eslint": "^10.12.0",
+    "jest": "^30.5.2",
+    "prettier": "^3.9.9",
+    "supertest": "^7.3.1",
+    "testcontainers": "^12.2.0",
+    "ts-jest": "^29.4.14",
+    "ts-node": "^10.9.2",
+    "typescript": "^6.0.3",
+    "typescript-eslint": "^8.71.1"
+  }
+}

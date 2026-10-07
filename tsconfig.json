@@ -1,0 +1,27 @@
+{
+  "compilerOptions": {
+    "module": "nodenext",
+    "moduleResolution": "nodenext",
+    "target": "ES2023",
+    "lib": ["ES2023"],
+    "strict": true,
+    "emitDecoratorMetadata": true,
+    "experimentalDecorators": true,
+    "esModuleInterop": true,
+    "isolatedModules": true,
+    "skipLibCheck": true,
+    "forceConsistentCasingInFileNames": true,
+    "resolveJsonModule": true,
+    "sourceMap": true,
+    "outDir": "./dist",
+    "rootDir": "./",
+    "types": ["node", "jest"],
+    "paths": {
+      "@app/contracts": ["./libs/contracts/src"],
+      "@app/contracts/*": ["./libs/contracts/src/*"],
+      "@app/messaging": ["./libs/messaging/src"],
+      "@app/messaging/*": ["./libs/messaging/src/*"]
+    }
+  },
+  "include": ["apps/**/*.ts", "libs/**/*.ts", "test/**/*.ts"]
+}
