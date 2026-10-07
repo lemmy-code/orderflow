@@ -34,6 +34,9 @@ export async function enqueue(m: EntityManager, event: AnyEvent): Promise<void> 
   await m.insert(OutboxMessage, { eventId: event.eventId, topic: topicFor(event.type), key: event.orderId, payload: event });
 }
 
+/** Advisory-lock key: only the publisher holding it may send, so outbox order is publish order. */
+export const OUTBOX_LOCK_KEY = 4_242_001;
+
 export type ProducerLike = Pick<Producer, 'connect' | 'disconnect' | 'sendBatch'>;
 
 export interface OutboxPublisherOptions {
@@ -73,17 +76,21 @@ export class OutboxPublisher {
 
   /**
    * Sends the oldest unsent rows and marks them sent, in one transaction. If Kafka throws, the transaction
-   * rolls back and the rows go out on a later run. SKIP LOCKED lets two publisher instances share the table.
+   * rolls back and the rows go out on a later run (so a row can be sent twice; consumers dedupe by eventId).
+   * A transaction-scoped advisory lock admits one publisher at a time: with several service instances, two
+   * publishers sending interleaved batches could deliver an order's events out of order.
    */
   async publishBatch(): Promise<number> {
     return this.ds.transaction(async (m) => {
+      const [{ locked }]: { locked: boolean }[] = await m.query('SELECT pg_try_advisory_xact_lock($1) AS locked', [
+        OUTBOX_LOCK_KEY,
+      ]);
+      if (!locked) return 0; // another instance is publishing; it will send these rows in order
       const rows = await m
         .createQueryBuilder(OutboxMessage, 'o')
         .where('o.sent_at IS NULL')
         .orderBy('o.seq', 'ASC')
         .limit(this.o.batchSize ?? 100)
-        .setLock('pessimistic_write')
-        .setOnLocked('skip_locked')
         .getMany();
       if (rows.length === 0) return 0;
 

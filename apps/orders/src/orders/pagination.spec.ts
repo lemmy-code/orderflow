@@ -22,6 +22,9 @@ describe('pagination', () => {
     'garbage',
     Buffer.from('no-separator').toString('base64url'),
     Buffer.from('not-a-date|abc').toString('base64url'),
+    // Date.parse accepts these, Postgres does not: they must not reach the query as a 500.
+    Buffer.from('1|11111111-1111-4111-8111-111111111111').toString('base64url'),
+    Buffer.from('2026-02-30T00:00:00.000Z|11111111-1111-4111-8111-111111111111').toString('base64url'),
   ])('rejects a malformed cursor %s', (c) => {
     expect(() => decodeCursor(c)).toThrow(InvalidInputError);
   });

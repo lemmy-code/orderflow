@@ -1,4 +1,4 @@
-import { EventTypes, newEnvelope, OrderEvent, OrderItemLine, StockEvent } from '@app/contracts';
+import { ContractError, EventTypes, newEnvelope, OrderEvent, OrderItemLine, StockEvent } from '@app/contracts';
 import { enqueue, markProcessed } from '@app/messaging';
 import { Injectable } from '@nestjs/common';
 import { DataSource, EntityManager } from 'typeorm';
@@ -85,8 +85,11 @@ export class OrdersService {
         const items = await m.find(OrderItem, { where: { order: { id: order.id } } });
         let total = 0;
         for (const item of items) {
-          item.unitPriceCents = prices.get(item.productId) ?? 0;
-          total += item.unitPriceCents * item.quantity;
+          const price = prices.get(item.productId);
+          // Rolls back markProcessed too; the consumer dead-letters ContractError without retrying.
+          if (price === undefined) throw new ContractError(`stock.reserved has no price for product ${item.productId}`);
+          item.unitPriceCents = price;
+          total += price * item.quantity;
         }
         await m.save(items);
         order.status = OrderStatus.RESERVED;

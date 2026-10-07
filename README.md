@@ -18,8 +18,8 @@ flowchart LR
   oe --> inv
   idb -. outbox publisher .-> se[[stock-events]]
   se --> orders
-  oe -. after 3 failed attempts .-> oedlq[[order-events.dlq]]
-  se -. after 3 failed attempts .-> sedlq[[stock-events.dlq]]
+  oe -. retries exhausted .-> oedlq[[order-events.dlq]]
+  se -. retries exhausted .-> sedlq[[stock-events.dlq]]
 ```
 
 ## Run it
@@ -47,21 +47,30 @@ mutation { payOrder(id: "<id>") { status } }
 ```
 
 An order starts `PENDING`, becomes `RESERVED` or `REJECTED` (with a reason) once inventory answers, then `PAID` or
-`CANCELLED`. Errors carry `extensions.code`: `BAD_USER_INPUT`, `NOT_FOUND` or `INVALID_STATE`.
+`CANCELLED`. Resolver errors carry `extensions.code`: `BAD_USER_INPUT`, `NOT_FOUND` or `INVALID_STATE`. A request that is
+not valid GraphQL to begin with (for example `quantity: 1.5` written inline) is rejected by GraphQL itself with
+`GRAPHQL_VALIDATION_FAILED`.
+
+`./scripts/smoke.sh` places an order against the running stack and waits until inventory has reserved it.
 
 ## Design decisions
 
 - **Transactional outbox.** The order row and its `order.created` event are written in one transaction; a publisher
-  loop sends unsent rows to Kafka. A crash can delay an event but never lose one or invent one. Inventory replies
-  through its own outbox for the same reason.
-- **Idempotent consumers.** Kafka delivers at least once. Each handler records the event id in `processed_events` in
-  the same transaction as its change, so a redelivery is a no-op.
+  loop sends unsent rows to Kafka. A crash can delay an event, or make it go out twice (sent, then the "sent" mark
+  rolled back), but never lose one or invent one. Inventory replies through its own outbox for the same reason.
+- **One publisher at a time.** Each batch takes a Postgres advisory lock, so several instances of a service can run
+  without two publishers interleaving one order's events out of order.
+- **Idempotent consumers.** Kafka and the outbox both deliver at least once. Each handler records the event id in
+  `processed_events` in the same transaction as its change, so a redelivery is a no-op.
 - **One topic per stream, keyed by order id.** `order.created` and `order.cancelled` share `order-events`, so Kafka
   keeps them in order for each order.
 - **No overselling.** Inventory locks product rows (`SELECT … FOR UPDATE`, in id order to avoid deadlocks) before it
   checks and decrements stock.
-- **Dead-letter topics.** A failing message is retried 3 times with backoff, then moved to `<topic>.dlq` with the error,
-  so one bad message never blocks a partition. Invalid payloads skip the retries.
+- **Retries, then dead letters, then redrive.** A failing handler is retried with doubling backoff capped at 30 s, 10
+  attempts over about 80 s, so a database restart doesn't drop valid events. After that the message moves to
+  `<topic>.dlq` with the error, so it can't block its partition forever. Invalid payloads go there immediately.
+  `npm run redrive -- order-events` replays the valid ones (safe, because consumers ignore event ids they've seen) and
+  leaves contract violations where they are.
 - **No config at import time.** Every env var is read when its module starts and has a local default. CI runs from a
   clean checkout with no `.env`.
 
@@ -71,10 +80,10 @@ An order starts `PENDING`, becomes `RESERVED` or `REJECTED` (with a reason) once
 |---|---|---|---|
 | Unit | Is the logic right? (state machine, stock rules, retry policy, validation, contracts) | nothing | `npm run test:unit` |
 | Integration | Do the pieces work with a real database? (atomic outbox, row locks under concurrency, duplicate events) | PostgreSQL (Testcontainers) | `npm run test:int` |
-| End to end | Does the system work? Both services, real Kafka: reserve, reject, release, duplicate delivery, poison message → DLQ | PostgreSQL + Kafka (Testcontainers) | `npm run test:e2e` |
+| End to end | Does the system work? Both services, real Kafka: reserve, reject, release, duplicate delivery, poison message → DLQ, redrive | PostgreSQL + Kafka (Testcontainers) | `npm run test:e2e` |
 
-CI runs lint, typecheck and all three layers on every push, and a second job boots the Compose stack and places an
-order. Locally you need Node 24.9+ and a running Docker engine (Docker Desktop, OrbStack or Colima; with Colima also
+CI runs lint, typecheck and all three layers on every push, and a second job boots the Compose stack and runs
+`scripts/smoke.sh`. Locally you need Node 24.9+ and a running Docker engine (Docker Desktop, OrbStack or Colima; with Colima also
 `export TESTCONTAINERS_DOCKER_SOCKET_OVERRIDE=/var/run/docker.sock`).
 
 ## Stack

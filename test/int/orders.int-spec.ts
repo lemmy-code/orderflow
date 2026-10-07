@@ -1,4 +1,4 @@
-import { EventTypes, newEnvelope, StockRejected, StockReserved } from '@app/contracts';
+import { ContractError, EventTypes, newEnvelope, StockRejected, StockReserved } from '@app/contracts';
 import { StartedPostgreSqlContainer } from '@testcontainers/postgresql';
 import { DataSource } from 'typeorm';
 import { ordersDataSourceOptions } from '../../apps/orders/src/data-source';
@@ -73,6 +73,20 @@ describe('OrdersService (real PostgreSQL)', () => {
     const after = await orders.findById(o.id);
     expect(after).toMatchObject({ status: OrderStatus.RESERVED, totalCents: 2 * 8999 + 2999 });
     expect(after?.items.map((i) => i.unitPriceCents).sort()).toEqual([2999, 8999]);
+  });
+
+  it('refuses a stock.reserved that leaves an item unpriced, instead of charging 0 for it', async () => {
+    const o = await orders.create([
+      { productId: KEYBOARD, quantity: 1 },
+      { productId: MOUSE, quantity: 1 },
+    ]);
+    const partial: StockReserved = {
+      ...newEnvelope(o.id),
+      type: EventTypes.StockReserved,
+      lines: [{ productId: KEYBOARD, unitPriceCents: 8999 }],
+    };
+    await expect(orders.applyStockReply(partial)).rejects.toThrow(ContractError);
+    expect(await orders.findById(o.id)).toMatchObject({ status: OrderStatus.PENDING, totalCents: null });
   });
 
   it('applies stock.rejected with its reason', async () => {

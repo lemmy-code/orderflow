@@ -3,6 +3,7 @@ import {
   enqueue,
   markProcessed,
   MESSAGING_TABLES_SQL,
+  OUTBOX_LOCK_KEY,
   OutboxMessage,
   OutboxPublisher,
   ProcessedEvent,
@@ -66,6 +67,22 @@ describe('messaging persistence', () => {
       expect(producer.sent.every((s) => s.topic === 'order-events' && s.key === ORDER)).toBe(true);
       await expect(publisher.publishBatch()).resolves.toBe(0);
       expect(producer.sent).toHaveLength(2);
+    });
+
+    it('lets only one publisher send at a time, so a second instance cannot reorder events', async () => {
+      await ds.transaction((m) => enqueue(m, cancelled()));
+      const otherInstance = ds.createQueryRunner();
+      await otherInstance.connect();
+      await otherInstance.query('SELECT pg_advisory_lock($1)', [OUTBOX_LOCK_KEY]);
+      try {
+        const producer = new FakeProducer();
+        const publisher = new OutboxPublisher(ds, producer, { intervalMs: 1000 });
+        await expect(publisher.publishBatch()).resolves.toBe(0);
+        expect(producer.sent).toHaveLength(0);
+      } finally {
+        await otherInstance.query('SELECT pg_advisory_unlock($1)', [OUTBOX_LOCK_KEY]);
+        await otherInstance.release();
+      }
     });
 
     it('keeps rows unsent when Kafka is down and sends them on the next run', async () => {

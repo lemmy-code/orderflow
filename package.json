@@ -15,7 +15,8 @@
     "test:unit": "NODE_OPTIONS=--experimental-vm-modules jest --selectProjects unit",
     "test:int": "NODE_OPTIONS=--experimental-vm-modules jest --selectProjects int --runInBand",
     "test:e2e": "NODE_OPTIONS=--experimental-vm-modules jest --selectProjects e2e --runInBand",
-    "test": "npm run test:unit && npm run test:int && npm run test:e2e"
+    "test": "npm run test:unit && npm run test:int && npm run test:e2e",
+    "redrive": "tsx scripts/redrive.ts"
   },
   "dependencies": {
     "@apollo/server": "^5.5.1",
@@ -53,6 +54,7 @@
     "ts-loader": "^9.6.2",
     "ts-node": "^10.9.2",
     "tsconfig-paths-webpack-plugin": "^4.2.0",
+    "tsx": "^4.23.15",
     "typescript": "^6.0.3",
     "typescript-eslint": "^8.71.1",
     "webpack": "^5.111.1",

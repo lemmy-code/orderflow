@@ -21,7 +21,9 @@ export function encodeCursor(row: { createdAt: Date; id: string }): string {
 
 export function decodeCursor(cursor: string): Cursor {
   const [createdAt, id, ...rest] = Buffer.from(cursor, 'base64url').toString('utf8').split('|');
-  if (rest.length > 0 || !createdAt || Number.isNaN(Date.parse(createdAt)) || !isUuid(id)) {
+  // Exact round-trip, not Date.parse: it accepts "1" or Feb 30, which Postgres then rejects with a 500.
+  const exact = !Number.isNaN(Date.parse(createdAt)) && new Date(createdAt).toISOString() === createdAt;
+  if (rest.length > 0 || !createdAt || !exact || !isUuid(id)) {
     throw new InvalidInputError('after is not a valid cursor');
   }
   return { createdAt, id };

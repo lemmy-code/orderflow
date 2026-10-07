@@ -23,5 +23,5 @@
       "@app/messaging/*": ["./libs/messaging/src/*"]
     }
   },
-  "include": ["apps/**/*.ts", "libs/**/*.ts", "test/**/*.ts"]
+  "include": ["apps/**/*.ts", "libs/**/*.ts", "test/**/*.ts", "scripts/**/*.ts"]
 }

@@ -5,3 +5,4 @@ export * from './kafka';
 export * from './schema';
 export * from './idempotency';
 export * from './outbox';
+export * from './redrive';

@@ -99,8 +99,8 @@ IDs are listed in the README. (No `products` query: products belong to inventory
 
 - **Duplicate delivery.** Kafka is at-least-once. Every consumer inserts the `eventId` into `processed_events` **in the
   same transaction** as its state change; if the insert conflicts, the message is a repeat and is skipped.
-- **Poison messages.** A handler failure is retried with exponential backoff (3 attempts in total). After that the
-  message is published to `<topic>.dlq` with the error and attempt count, and the offset is committed, so one bad message never
+- **Poison messages.** A handler failure is retried with exponential backoff capped at 30 s (10 attempts, about 80 s, so
+  a database restart doesn't dead-letter valid events). After that the message is published to `<topic>.dlq` with the error and attempt count, and the offset is committed, so one bad message never
   blocks the partition.
 - **Contract violations.** Incoming payloads are validated against `libs/contracts` before handling; an invalid payload
   goes straight to the DLQ (retrying can't fix it).
@@ -170,3 +170,13 @@ It goes on the resume only after the repo is public and CI is passing, and its d
    services; **KafkaJS is used directly** instead of `@nestjs/microservices`, whose Kafka transport hides the retry and
    DLQ control this design needs.
 5. Validation is a pure function instead of `class-validator`, so one implementation is tested once.
+
+**After the final code review (2026-10-07):**
+
+6. Retries span about 80 s (10 attempts, backoff capped at 30 s) instead of 3 attempts in 0.6 s, which dead-lettered
+   valid events on a one-second database blip; `npm run redrive -- <topic>` replays dead letters that still pass
+   the contract.
+7. The outbox publisher takes a Postgres advisory lock per batch, so several instances of a service can't reorder one
+   order's events.
+8. A `stock.reserved` with a missing price is a contract error (dead-lettered), never priced at 0; a cursor must
+   round-trip exactly as an ISO timestamp.

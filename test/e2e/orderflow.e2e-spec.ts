@@ -1,5 +1,5 @@
 import { dlqTopic, EventTypes, newEnvelope, Topics } from '@app/contracts';
-import { createKafka } from '@app/messaging';
+import { createKafka, redrive } from '@app/messaging';
 import { INestApplication, INestApplicationContext } from '@nestjs/common';
 import { NestFactory } from '@nestjs/core';
 import { StartedKafkaContainer } from '@testcontainers/kafka';
@@ -152,6 +152,30 @@ describe('orderflow end to end', () => {
     }
     expect(dead.map((d) => d.original)).toContain('definitely not json');
     expect(dead.every((d) => d.attempts === 1)).toBe(true);
+  });
+
+  it('7. redrive replays a valid event that was dead-lettered during an outage', async () => {
+    const before = await stockOf(MOUSE);
+    const id = await createOrder([{ productId: MOUSE, quantity: 1 }]);
+    await waitForStatus(id, 'RESERVED');
+
+    // An order.cancelled that exhausted its retries while the database was down: dead-lettered, never applied.
+    const cancel = { ...newEnvelope(id), type: EventTypes.OrderCancelled };
+    const letter = {
+      topic: Topics.OrderEvents,
+      key: id,
+      original: JSON.stringify(cancel),
+      error: 'connection terminated',
+      attempts: 10,
+      failedAt: new Date().toISOString(),
+    };
+    await rawProducer.send({ topic: dlqTopic(Topics.OrderEvents), messages: [{ key: id, value: JSON.stringify(letter) }] });
+    expect(await stockOf(MOUSE)).toBe(before - 1);
+
+    const result = await redrive(kafka, Topics.OrderEvents, { idleMs: 3000 });
+    expect(result.redriven).toBe(1);
+    expect(result.skipped).toBeGreaterThanOrEqual(2); // the two contract violations from scenario 5 stay put
+    await waitFor(() => stockOf(MOUSE), (s) => s === before);
   });
 
   it('6. refuses to pay a REJECTED order', async () => {

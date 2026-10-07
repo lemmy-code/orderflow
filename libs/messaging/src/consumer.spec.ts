@@ -1,5 +1,6 @@
 import { EventTypes, Topics } from '@app/contracts';
 import { DeadLetter, processMessage, ProcessDeps } from './consumer';
+import { MAX_ATTEMPTS } from './retry';
 
 const valid = JSON.stringify({
   type: EventTypes.OrderCancelled,
@@ -39,13 +40,14 @@ describe('processMessage', () => {
     expect(dead).toHaveLength(0);
   });
 
-  it('dead-letters after 3 failed attempts, keeping the original and the error', async () => {
+  it('dead-letters after the last attempt, keeping the original and the error', async () => {
     const handle = jest.fn().mockRejectedValue(new Error('always broken'));
     const { d, dead, sleeps } = deps(handle);
     await expect(processMessage(msg(valid), d)).resolves.toBe('dead-lettered');
-    expect(handle).toHaveBeenCalledTimes(3);
-    expect(sleeps).toEqual([200, 400]);
-    expect(dead[0]).toMatchObject({ topic: 'order-events', key: 'k', original: valid, error: 'always broken', attempts: 3 });
+    expect(handle).toHaveBeenCalledTimes(MAX_ATTEMPTS);
+    expect(sleeps.slice(0, 2)).toEqual([200, 400]);
+    expect(sleeps).toHaveLength(MAX_ATTEMPTS - 1);
+    expect(dead[0]).toMatchObject({ topic: 'order-events', key: 'k', original: valid, error: 'always broken', attempts: MAX_ATTEMPTS });
   });
 
   it('dead-letters a malformed message immediately without calling the handler', async () => {
