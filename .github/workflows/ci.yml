@@ -1,0 +1,35 @@
+name: CI
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 24, cache: npm }
+      - run: npm ci
+      - run: npm run lint
+      - run: npm run typecheck
+      - run: npm run test:unit -- --coverage
+      - run: npm run test:int
+      - run: npm run test:e2e
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with: { name: coverage, path: coverage }
+
+  compose-smoke:
+    # Proves the shipped containers start from a clean checkout, not just that the tests pass.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker compose up --build --wait
+      - name: Place an order
+        run: |
+          curl -sf localhost:3000/graphql -H 'content-type: application/json' \
+            -d '{"query":"mutation { createOrder(items: [{productId: \"11111111-1111-4111-8111-111111111111\", quantity: 1}]) { id } }"}' \
+            | tee /tmp/out.json | grep -q '"id"'
+      - if: failure()
+        run: docker compose logs
