@@ -1,5 +1,15 @@
 # orderflow Implementation Plan
 
+> **Historical record.** This is the plan as written before implementation, kept unedited below. What shipped differs
+> in these places (each is recorded in the commit history, and the spec's §10 is the current design):
+> - **Node 24.9+ and TypeScript 6** instead of Node 22 / TypeScript 5.9: NestJS 12 requires TypeScript 6 and ships
+>   ES modules only, which Jest can load only on Node ≥ 24.9 with `--experimental-vm-modules`.
+> - **Retries:** 10 attempts with backoff capped at 30 s (about 80 s) instead of 3, plus `npm run redrive`.
+> - **Outbox:** a Postgres advisory lock admits one publisher at a time (instead of `SKIP LOCKED`).
+> - **Stricter input:** cursors must round-trip exactly; a `stock.reserved` missing a price is a contract error.
+> - **CI smoke test:** `scripts/smoke.sh` waits until the order is `RESERVED`.
+> - **Local Compose:** ports bound to `127.0.0.1`; each service has its own database login.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Two event-driven NestJS services (orders, inventory) linked only by Kafka, with a transactional outbox, idempotent consumers, a DLQ, and unit, integration and e2e tests that run in CI from a clean checkout.

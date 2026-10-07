@@ -86,6 +86,13 @@ CI runs lint, typecheck and all three layers on every push, and a second job boo
 `scripts/smoke.sh`. Locally you need Node 24.9+ and a running Docker engine (Docker Desktop, OrbStack or Colima; with Colima also
 `export TESTCONTAINERS_DOCKER_SOCKET_OVERRIDE=/var/run/docker.sock`).
 
+## Project docs
+
+- [Design spec](docs/superpowers/specs/2026-10-07-orderflow-design.md): requirements, architecture, failure handling, and
+  the revisions made during planning and review (§10).
+- [Implementation plan](docs/superpowers/plans/2026-10-07-orderflow.md): the task-by-task, test-first plan it was built
+  from.
+
 ## Stack
 
 TypeScript · NestJS 12 · GraphQL (Apollo, code-first) · PostgreSQL · TypeORM · Kafka (KafkaJS) · Jest · Supertest ·
