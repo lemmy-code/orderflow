@@ -9,3 +9,6 @@ export const TOOL_TIERS: Readonly<Record<string, Tier>> = {
   pay_order: 'approval',
   cancel_order: 'approval',
 };
+
+/** Own keys only: "constructor" or "toString" must not count as a tier (no prototype bypass of default deny). */
+export const hasTier = (tool: string): boolean => Object.hasOwn(TOOL_TIERS, tool);

@@ -16,9 +16,14 @@ export interface ToolResultBlock {
   content: string;
   is_error?: boolean;
 }
+/** A block the loop doesn't interpret (e.g. thinking) but must send back unchanged. */
+export interface OpaqueBlock {
+  type: string;
+  [key: string]: unknown;
+}
 export interface Message {
   role: 'user' | 'assistant';
-  content: string | (TextBlock | ToolUseBlock | ToolResultBlock)[];
+  content: string | (TextBlock | ToolUseBlock | ToolResultBlock | OpaqueBlock)[];
 }
 
 export interface ToolSpec {
@@ -34,7 +39,10 @@ export interface ModelRequest {
   maxTokens: number;
 }
 export interface ModelReply {
+  /** The text and tool_use blocks the loop acts on. */
   content: (TextBlock | ToolUseBlock)[];
+  /** The reply exactly as the API returned it (incl. thinking blocks), echoed back unchanged in the history. */
+  raw?: (TextBlock | ToolUseBlock | OpaqueBlock)[];
   stopReason: string | null;
   usage: TokenUsage;
 }

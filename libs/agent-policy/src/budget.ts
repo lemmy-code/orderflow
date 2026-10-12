@@ -29,7 +29,7 @@ export class Budget {
   }
 }
 
-/** An estimate for display; real prices depend on the model and are configurable. */
-export function estimateCostUsd(u: TokenUsage, price = { inPerMTok: 3, outPerMTok: 15 }): number {
+/** An estimate for display at Sonnet 5.5 list prices ($2 / $10 per million tokens); pass other prices for other models. */
+export function estimateCostUsd(u: TokenUsage, price = { inPerMTok: 2, outPerMTok: 10 }): number {
   return (u.inputTokens * price.inPerMTok + u.outputTokens * price.outPerMTok) / 1_000_000;
 }

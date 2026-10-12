@@ -155,6 +155,40 @@ describe('runAgent', () => {
     expect(sent).toMatch(/truncated/);
   });
 
+  it('sends the assistant reply back unchanged, including blocks it does not use (thinking)', async () => {
+    const thinking = { type: 'thinking', thinking: 'I need the product id first.', signature: 'sig-abc' };
+    const first = reply([toolUse('t1', 'list_products', {})]);
+    first.raw = [thinking, ...first.content];
+    const model = new FakeModel([first, reply([say('ok')])]);
+    await runAgent('x', { model, tools: gateway().g, approver: approver(false), trace: memoryTrace() });
+    const echoed = model.requests[1].messages[1];
+    expect(echoed.role).toBe('assistant');
+    expect(echoed.content).toEqual([thinking, { type: 'tool_use', id: 't1', name: 'list_products', input: {} }]);
+  });
+
+  it('asks for room to think: 16,000 output tokens per reply by default', async () => {
+    const model = new FakeModel([reply([say('ok')])]);
+    await runAgent('x', { model, tools: gateway().g, approver: approver(false), trace: memoryTrace() });
+    expect(model.requests[0].maxTokens).toBe(16_000);
+  });
+
+  it('handles allowed, unknown and approval tools mixed in one reply', async () => {
+    const model = new FakeModel([
+      reply([toolUse('a', 'get_order', { orderId: '1' }), toolUse('b', 'nuke', {}), toolUse('c', 'cancel_order', { orderId: '1' })]),
+      reply([say('done')]),
+    ]);
+    const { g, calls } = gateway();
+    const ap = approver(false);
+    await runAgent('x', { model, tools: g, approver: ap, trace: memoryTrace() });
+    expect(calls.map((c) => c.name)).toEqual(['get_order']);
+    expect(ap.asked).toEqual(['cancel_order']);
+    expect(lastUserBlocks(model).map((b) => [b.tool_use_id, b.is_error ?? false])).toEqual([
+      ['a', false],
+      ['b', true],
+      ['c', true],
+    ]);
+  });
+
   it('ends with outcome error when the tool transport fails', async () => {
     const g: ToolGateway = {
       listTools: async () => SPECS,

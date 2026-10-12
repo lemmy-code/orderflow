@@ -17,6 +17,9 @@ describe('decide', () => {
   it('refuses a tool the server has but nobody has given a tier', () => {
     expect(decide('refund_order', new Set([...exposed, 'refund_order'])).kind).toBe('deny');
   });
+  it.each(['constructor', 'toString', '__proto__', 'hasOwnProperty'])('refuses %s even if a server offers it (no prototype bypass)', (t) => {
+    expect(decide(t, new Set([...exposed, t])).kind).toBe('deny');
+  });
 });
 
 describe('parseApproval', () => {

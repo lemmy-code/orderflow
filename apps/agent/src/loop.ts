@@ -1,4 +1,4 @@
-import { Budget, decide, DEFAULT_LIMITS, Limits, MAX_TOOL_RESULT_CHARS, TOOL_TIERS } from '@app/agent-policy';
+import { Budget, decide, DEFAULT_LIMITS, hasTier, Limits, MAX_TOOL_RESULT_CHARS } from '@app/agent-policy';
 import { SYSTEM_PROMPT } from './prompt';
 import { Approver, Message, ModelClient, ToolGateway, ToolResultBlock, ToolUseBlock, TraceSink } from './types';
 
@@ -44,7 +44,7 @@ export async function runAgent(task: string, d: AgentDeps): Promise<RunResult> {
   let lastText = '';
   try {
     // Only reviewed (tiered) tools are shown to the model; anything else on the server stays invisible.
-    const specs = (await d.tools.listTools()).filter((t) => TOOL_TIERS[t.name]);
+    const specs = (await d.tools.listTools()).filter((t) => hasTier(t.name));
     const exposed = new Set(specs.map((t) => t.name));
     const messages: Message[] = [{ role: 'user', content: task }];
     d.trace.write({ type: 'task', at: now(), task, tools: [...exposed] });
@@ -57,7 +57,7 @@ export async function runAgent(task: string, d: AgentDeps): Promise<RunResult> {
         system: d.system ?? SYSTEM_PROMPT,
         messages,
         tools: specs,
-        maxTokens: d.maxTokensPerReply ?? 2048,
+        maxTokens: d.maxTokensPerReply ?? 16_000, // thinking counts toward this, so leave room
       });
       budget.record(r.usage);
       lastText = r.content
@@ -65,7 +65,8 @@ export async function runAgent(task: string, d: AgentDeps): Promise<RunResult> {
         .map((b) => (b as { text: string }).text)
         .join('\n');
       d.trace.write({ type: 'model', at: now(), step: budget.steps, stopReason: r.stopReason, usage: r.usage, text: lastText });
-      messages.push({ role: 'assistant', content: r.content });
+      // The reply goes back exactly as received: models that think require their thinking blocks unchanged.
+      messages.push({ role: 'assistant', content: r.raw ?? r.content });
 
       if (r.stopReason !== 'tool_use') {
         return r.stopReason === 'end_turn'

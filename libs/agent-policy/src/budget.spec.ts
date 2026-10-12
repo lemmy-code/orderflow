@@ -15,4 +15,7 @@ describe('Budget', () => {
   it('estimates cost from per-million-token prices', () => {
     expect(estimateCostUsd({ inputTokens: 1_000_000, outputTokens: 100_000 }, { inPerMTok: 3, outPerMTok: 15 })).toBeCloseTo(4.5);
   });
+  it('defaults to Sonnet 5.5 prices ($2 in / $10 out per million tokens)', () => {
+    expect(estimateCostUsd({ inputTokens: 1_000_000, outputTokens: 1_000_000 })).toBeCloseTo(12);
+  });
 });

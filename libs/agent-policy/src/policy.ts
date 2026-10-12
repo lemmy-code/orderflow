@@ -1,14 +1,13 @@
-import { TOOL_TIERS } from './tiers';
+import { hasTier, TOOL_TIERS } from './tiers';
 
 export type Decision = { kind: 'allow' } | { kind: 'ask'; reason: string } | { kind: 'deny'; reason: string };
 
 export function decide(tool: string, exposed: ReadonlySet<string>): Decision {
-  const tier = TOOL_TIERS[tool];
-  if (!exposed.has(tool) || !tier) {
-    const known = [...exposed].filter((t) => TOOL_TIERS[t]).sort().join(', ');
+  if (!exposed.has(tool) || !hasTier(tool)) {
+    const known = [...exposed].filter(hasTier).sort().join(', ');
     return { kind: 'deny', reason: `Tool "${tool}" is not available. Available tools: ${known}.` };
   }
-  if (tier === 'approval') return { kind: 'ask', reason: `${tool} changes money or cancels work, so a human must approve it.` };
+  if (TOOL_TIERS[tool] === 'approval') return { kind: 'ask', reason: `${tool} changes money or cancels work, so a human must approve it.` };
   return { kind: 'allow' };
 }
 

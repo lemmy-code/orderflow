@@ -1,5 +1,5 @@
 import Anthropic from '@anthropic-ai/sdk';
-import { ModelClient, TextBlock, ToolUseBlock } from './types';
+import { ModelClient, OpaqueBlock, TextBlock, ToolUseBlock } from './types';
 
 /** The real model: one Messages API call per step. Our block types are a subset of the SDK's, so they pass straight through. */
 export function anthropicModel(o: { model: string; apiKey?: string }): ModelClient {
@@ -25,6 +25,7 @@ export function anthropicModel(o: { model: string; apiKey?: string }): ModelClie
               ? [{ type: 'tool_use' as const, id: b.id, name: b.name, input: b.input }]
               : [],
         ),
+        raw: m.content as unknown as OpaqueBlock[], // incl. thinking blocks with their signatures
         stopReason: m.stop_reason,
         usage: { inputTokens: m.usage.input_tokens, outputTokens: m.usage.output_tokens },
       };
