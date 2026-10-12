@@ -48,5 +48,5 @@ answered by the first live run.
 |---|---|
 | Final review by an independent reviewer (most capable model) | Mon 12.10 20:50 → 20:55: **1 critical, 4 important, 8 minor** — see Fix pass |
 | Fix pass (critical + important, each with a failing test first) | Mon 12.10 20:55 → Mon 12.10 21:39: ✅ all fixed, **164/164 tests** (116 unit, 41 int, 7 e2e) | `c079328` `acea5dd` `930a782` `ee52771` + docs |
-| Merge `feat/agent` into `main` and push; CI green on GitHub | next |
+| Merge `feat/agent` into `main` and push; CI green on GitHub | ✅ Mon 12.10 21:41 — CI run 38299110384: test ✅, compose-smoke ✅ |
 | **Live run with the real Claude** (`npm run agent`, `npm run agent:sdk`, `npm run eval`) | ⚠️ needs an `ANTHROPIC_API_KEY` in `.env` — not done |
