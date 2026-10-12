@@ -1,6 +1,6 @@
 import { anthropicModel } from '../apps/agent/src/anthropic-model';
 import { runAgent } from '../apps/agent/src/loop';
-import { connectMcpGateway, stdioServerTransport } from '../apps/agent/src/mcp-gateway';
+import { connectMcpGateway, mcpServerEnv, stdioServerTransport } from '../apps/agent/src/mcp-gateway';
 import { memoryTrace } from '../apps/agent/src/trace';
 import { graphqlOrdersApi } from '../apps/mcp-server/src/orders-api';
 import { Call, CASES } from './cases';
@@ -27,7 +27,7 @@ async function main(): Promise<void> {
   let failed = 0;
   const created: string[] = [seed.id];
   for (const c of CASES) {
-    const tools = await connectMcpGateway(stdioServerTransport({ ...process.env, ORDERS_GRAPHQL_URL: url } as Record<string, string>));
+    const tools = await connectMcpGateway(stdioServerTransport(mcpServerEnv(process.env, url)));
     const trace = memoryTrace();
     const r = await runAgent(c.task({ orderId: seed.id }), { model, tools, trace, approver: { approve: async () => false } });
     await tools.close();

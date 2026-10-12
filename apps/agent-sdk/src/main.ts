@@ -2,6 +2,7 @@ import { query } from '@anthropic-ai/claude-agent-sdk';
 import { decide, DEFAULT_LIMITS, TOOL_TIERS } from '@app/agent-policy';
 import { resolve } from 'node:path';
 import { cliApprover } from '../../agent/src/approver';
+import { mcpServerEnv } from '../../agent/src/mcp-gateway';
 import { SYSTEM_PROMPT } from '../../agent/src/prompt';
 
 /** The Agent SDK names MCP tools "mcp__<server>__<tool>"; our policy speaks plain tool names. */
@@ -33,10 +34,7 @@ async function main(): Promise<void> {
         orderflow: {
           command: process.execPath,
           args: ['--import', 'tsx', resolve(__dirname, '../../mcp-server/src/main.ts')],
-          env: {
-            ...process.env,
-            ORDERS_GRAPHQL_URL: process.env.ORDERS_GRAPHQL_URL ?? 'http://localhost:3000/graphql',
-          } as Record<string, string>,
+          env: mcpServerEnv(process.env, process.env.ORDERS_GRAPHQL_URL ?? 'http://localhost:3000/graphql'),
         },
       },
       // Same tiers as the hand-written agent, enforced through the framework's permission hook.
@@ -63,7 +61,9 @@ async function main(): Promise<void> {
       }
     }
     if (m.type === 'result') {
-      console.log(`\noutcome: ${m.subtype} · turns ${m.num_turns} · $${m.total_cost_usd.toFixed(4)}`);
+      // subtype can say "success" while is_error is true (e.g. a bad API key), so check both.
+      const outcome = m.is_error ? 'error' : m.subtype;
+      console.log(`\noutcome: ${outcome} · turns ${m.num_turns} · $${m.total_cost_usd.toFixed(4)}`);
     }
   }
 }

@@ -2,7 +2,7 @@ import { estimateCostUsd } from '@app/agent-policy';
 import { anthropicModel } from './anthropic-model';
 import { cliApprover } from './approver';
 import { runAgent } from './loop';
-import { connectMcpGateway, stdioServerTransport } from './mcp-gateway';
+import { connectMcpGateway, mcpServerEnv, stdioServerTransport } from './mcp-gateway';
 import { jsonlTrace } from './trace';
 
 async function main(): Promise<void> {
@@ -25,10 +25,7 @@ async function main(): Promise<void> {
     console.error('ANTHROPIC_API_KEY is not set (put it in .env).');
     process.exit(2);
   }
-  const env = {
-    ...process.env,
-    ORDERS_GRAPHQL_URL: process.env.ORDERS_GRAPHQL_URL ?? 'http://localhost:3000/graphql',
-  } as Record<string, string>;
+  const env = mcpServerEnv(process.env, process.env.ORDERS_GRAPHQL_URL ?? 'http://localhost:3000/graphql');
   const tools = await connectMcpGateway(stdioServerTransport(env));
   const trace = jsonlTrace('.agent-traces', echo);
   try {

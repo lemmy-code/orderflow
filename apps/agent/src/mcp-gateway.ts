@@ -32,6 +32,13 @@ export async function connectMcpGateway(transport: Transport): Promise<ToolGatew
   };
 }
 
+/** The MCP server's whole environment: what it needs to run and reach the API — never the Anthropic API key. */
+export function mcpServerEnv(from: NodeJS.ProcessEnv, ordersUrl: string): Record<string, string> {
+  const env: Record<string, string> = { ORDERS_GRAPHQL_URL: ordersUrl };
+  for (const k of ['PATH', 'HOME']) if (from[k]) env[k] = from[k] as string;
+  return env;
+}
+
 /** Spawns the MCP server as a child process; the two talk over its stdin and stdout. */
 export function stdioServerTransport(env: Record<string, string>): StdioClientTransport {
   return new StdioClientTransport({
