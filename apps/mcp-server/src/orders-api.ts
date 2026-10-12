@@ -28,6 +28,9 @@ export interface OrdersApi {
   cancelOrder(id: string): Promise<OrderView>;
 }
 
+/** Safety cap: at most 10 pages (1,000 orders) are scanned to find the newest. */
+const MAX_PAGES = 10;
+
 const FIELDS = 'id status totalCents rejectionReason items { productId quantity unitPriceCents }';
 
 type GqlError = { message: string; extensions?: { code?: string } };
@@ -59,9 +62,19 @@ export function graphqlOrdersApi(url: string, fetchImpl: typeof fetch = fetch): 
       if (!order) throw new OrdersApiError('NOT_FOUND', `Order ${id} not found`);
       return order;
     },
+    // The API pages oldest-first; the model needs "my last order", so walk the pages and return the newest first.
     async listOrders({ status, first }) {
-      const q = `query($status: OrderStatus, $first: Int) { orders(status: $status, first: $first) { nodes { ${FIELDS} } } }`;
-      return (await gql<{ orders: { nodes: OrderView[] } }>(q, { status, first })).orders.nodes;
+      const q = `query($status: OrderStatus, $after: String) { orders(status: $status, first: 100, after: $after) { nodes { ${FIELDS} } endCursor hasNextPage } }`;
+      const all: OrderView[] = [];
+      let after: string | null = null;
+      for (let page = 0; page < MAX_PAGES; page++) {
+        type Page = { orders: { nodes: OrderView[]; endCursor: string | null; hasNextPage: boolean } };
+        const res: Page = await gql<Page>(q, { status, after });
+        all.push(...res.orders.nodes);
+        if (!res.orders.hasNextPage || !res.orders.endCursor) break;
+        after = res.orders.endCursor;
+      }
+      return all.reverse().slice(0, first ?? 20);
     },
     async payOrder(id) {
       return (await gql<{ payOrder: OrderView }>(`mutation($id: ID!) { payOrder(id: $id) { ${FIELDS} } }`, { id })).payOrder;

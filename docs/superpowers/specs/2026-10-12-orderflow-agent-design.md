@@ -43,7 +43,7 @@ one reviewed place. The MCP server holds no state.
 | `list_products` | read | — | seeded catalogue: id, sku, name, price (static; stock lives in inventory, which has no API) |
 | `create_order` | write | `items: {productId: uuid, quantity: int 1–1000}[]` (1–50) | order id + status (`PENDING`) |
 | `get_order` | read | `orderId: uuid` | status, total, rejection reason, items |
-| `list_orders` | read | `status?`, `first?` (1–100) | orders, newest pages via cursor |
+| `list_orders` | read | `status?`, `first?` (1–100) | orders, newest first (the server pages through the API) |
 | `pay_order` | **approval** | `orderId: uuid` | new status |
 | `cancel_order` | **approval** | `orderId: uuid` | new status |
 

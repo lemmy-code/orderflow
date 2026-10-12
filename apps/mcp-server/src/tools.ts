@@ -70,7 +70,7 @@ export function registerOrderflowTools(server: McpServer, api: OrdersApi): void 
     'list_orders',
     {
       description:
-        'List existing orders, oldest first, optionally filtered by status. Use it to find an order id the user refers to.',
+        'List existing orders, newest first, optionally filtered by status. Use it to find an order the user refers to, e.g. "my last order" is the first result.',
       inputSchema: {
         status: z.enum(['PENDING', 'RESERVED', 'REJECTED', 'PAID', 'CANCELLED']).optional(),
         first: z.int().min(1).max(100).optional().describe('How many orders to return, default 20.'),
