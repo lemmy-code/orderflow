@@ -12,8 +12,8 @@ the commit that closed the task. Plan: `docs/superpowers/plans/2026-10-12-orderf
 | 3 | MCP server tests against the real orders API (Docker) | Mon 12.10 15:27 | Mon 12.10 15:28 | ✅ 4 tests pass | `fd61f39` |
 | 4 | Agent loop: policy, approvals, limits, truncation, trace | Mon 12.10 15:28 | Mon 12.10 15:29 | ✅ 12 tests pass | `7a0c667` |
 | 5 | Real adapters (Anthropic SDK, MCP stdio, y/N approval, JSONL trace, CLI) + end-to-end test | Mon 12.10 15:29 | Mon 12.10 15:30 | ✅ e2e passes; stdio smoke: 6 tools, bad args → isError | `33a5356` |
-| 6 | Claude Agent SDK version | Mon 12.10 20:45 | Mon 12.10 20:46 | ✅ typecheck against the real SDK types; no-key run exits cleanly. ⚠️ **live run not verified yet (no API key)** | `c48bbf7` |
-| 7 | Eval: 8 tasks against the real Claude | Mon 12.10 20:46 | Mon 12.10 20:46 | ✅ lint/types; all 8 checks verified with simulated good and bad runs (good → pass, bad → caught). ⚠️ **not run against the real model yet (no API key)** | `888d7c8` |
+| 6 | Claude Agent SDK version | Mon 12.10 20:45 | Mon 12.10 20:46 | ✅ typecheck against the real SDK types; no-key run exits cleanly. ✅ verified live, see below | `c48bbf7` |
+| 7 | Eval: 8 tasks against the real Claude | Mon 12.10 20:46 | Mon 12.10 20:46 | ✅ lint/types; all 8 checks verified with simulated good and bad runs (good → pass, bad → caught). ✅ 8/8 live, see below | `888d7c8` |
 | 8 | README section + LEARN study guide + full suite | Mon 12.10 20:47 | Mon 12.10 20:50 | ✅ lint, types, 100 unit + 41 integration + 7 e2e = **148/148**, also from a fresh clone with no .env | `b277ceb` |
 | — | Final review by an independent reviewer (most capable model) | Mon 12.10 20:50 | Mon 12.10 20:55 | 1 critical, 4 important, 8 minor (see below) | — |
 | — | Fix pass: critical + important, each with a failing test first | Mon 12.10 20:55 | Mon 12.10 21:39 | ✅ all fixed, **164/164 tests** | `c079328` `acea5dd` `930a782` `ee52771` `23fef87` |
@@ -45,8 +45,18 @@ the commit that closed the task. Plan: `docs/superpowers/plans/2026-10-12-orderf
 live instead · the reviewer could not confirm whether the API accepts the `$schema` key and `pattern` in tool schemas —
 answered by the first live run.
 
+## Live run with the real Claude — Mon 12.10 22:10 → Mon 12.10 22:14, model `claude-sonnet-5-5`
+
+| Run | What | Result | Cost |
+|---|---|---|---|
+| 1 | `npm run agent -- --trace "order 2 mechanical keyboards and pay for it"`, answered **n** | ✅ list_products → create_order → get_order (waited for RESERVED) → pay_order **denied-by-human** → stopped, reported the order as reserved but unpaid; 5 steps, no error on step 2 (thinking blocks echoed correctly) | ~$0.030 |
+| 2 | same flow for 1 wireless mouse, answered **y** | ✅ pay_order **approved-by-human** → order **PAID**, $29.99 | ~$0.029 |
+| 3 | `npm run agent:sdk -- "what is the status of my last order?"` | ✅ list_orders `{first: 1}` returned the **newest** order (the mouse, PAID) — the newest-first fix works through the Agent SDK | $0.009 |
+| 4 | `npm run eval` | ✅ **8/8 passed**, every run `done`; "order 2000" → explained the 1000 limit without calling create_order; "delete the database" → no tools; cleaned up 3 orders | — |
+
+Also confirmed live: the API accepts the tool schemas exactly as the MCP SDK produces them (`$schema`, uuid `pattern`) —
+the question the reviewer could not settle without a key.
+
 ## Still open
 
-| What | Status |
-|---|---|
-| **Live run with the real Claude** (`npm run agent`, `npm run agent:sdk`, `npm run eval`) | ⚠️ needs an `ANTHROPIC_API_KEY` in `.env` — not done |
+Nothing in the plan. Optional: prompt caching (`cache_control` on the system prompt and tools), an Agent SDK smoke script.
