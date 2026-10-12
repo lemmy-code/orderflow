@@ -23,11 +23,30 @@ the commit that closed the task. Plan: `docs/superpowers/plans/2026-10-12-orderf
 - Task 7: the eval denies every approval, so a live eval never pays or cancels anything; the "over the limit" case checks that the model *explains* the 1000-per-line limit.
 - Task 5: the end-to-end "model" counts assistant turns instead of wrapping the fake model (same behaviour, simpler).
 
+## What the fix pass changed
+
+| Finding | Severity | Fix | Proof |
+|---|---|---|---|
+| Thinking blocks dropped → second live step would likely fail | **critical** | raw reply echoed back unchanged | test *sends the assistant reply back unchanged* RED→GREEN |
+| 2,048 output tokens too small with thinking | important | 16,000 per reply | test RED→GREEN |
+| Eval counted crashed runs as passes | important | `score()` fails any run not `done` | `eval/score.spec.ts` RED→GREEN |
+| Eval used up stock | important | eval cancels the orders it created | `createdOrderIds` test RED→GREEN |
+| `list_orders` oldest-first → "my last order" impossible | important | newest first, paging through the API | `orders-api.spec.ts` RED→GREEN |
+| API key passed to the MCP server process | minor → **important** (secret leaves the agent) | only PATH, HOME, API URL | `mcp-gateway.spec.ts` RED→GREEN |
+| Cost estimate 50% high | minor → fixed (you quote it) | $2 / $10 defaults | test RED→GREEN |
+| `constructor` could bypass default deny | minor → fixed (headline claim) | `Object.hasOwn` | 4 tests RED→GREEN |
+| Agent SDK printed "success" on failure | minor → fixed | checks `is_error` | manual (needs real model) |
+| Docs said "hidden" for both agents | minor → fixed | README + LEARN corrected | — |
+
+**Deferred minors (not fixed, on purpose):** an Agent SDK smoke *script* (spec §6) — covered by running `npm run agent:sdk`
+live instead · the reviewer could not confirm whether the API accepts the `$schema` key and `pattern` in tool schemas —
+answered by the first live run.
+
 ## Still open
 
 | What | Status |
 |---|---|
 | Final review by an independent reviewer (most capable model) | Mon 12.10 20:50 → 20:55: **1 critical, 4 important, 8 minor** — see Fix pass |
-| Fix pass (critical + important, each with a failing test first) | started Mon 12.10 20:55 |
-| Merge `feat/agent` into `main` and push; CI green on GitHub | after the review |
+| Fix pass (critical + important, each with a failing test first) | Mon 12.10 20:55 → Mon 12.10 21:39: ✅ all fixed, **164/164 tests** (116 unit, 41 int, 7 e2e) | `c079328` `acea5dd` `930a782` `ee52771` + docs |
+| Merge `feat/agent` into `main` and push; CI green on GitHub | next |
 | **Live run with the real Claude** (`npm run agent`, `npm run agent:sdk`, `npm run eval`) | ⚠️ needs an `ANTHROPIC_API_KEY` in `.env` — not done |

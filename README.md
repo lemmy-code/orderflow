@@ -107,8 +107,19 @@ flowchart LR
 | `create_order` | write | creates a `PENDING` order; inventory reserves stock asynchronously |
 | `pay_order`, `cancel_order` | **needs your approval** | the agent asks `Allow? [y/N]` first; Enter means no |
 
-**Control:** tools without a tier are hidden and refused (default deny) · 12 model steps and 60,000 tokens per task ·
-tool results capped at 20,000 characters · API retries on 429/5xx · every step written to `.agent-traces/*.jsonl`.
+**Control:** tools without a tier are refused (default deny; the hand-written agent also hides them from the model) ·
+12 model steps and 60,000 tokens per task · 16,000 output tokens per reply (thinking counts) · thinking blocks sent back
+unchanged · tool results capped at 20,000 characters · API retries on 429/5xx · the MCP server never sees the API key ·
+every step written to `.agent-traces/*.jsonl`.
+
+A trace is one JSON object per line, for example:
+
+```json
+{"type":"tool_request","at":"…","id":"toolu_02","tool":"create_order","input":{"items":[{"productId":"1111…","quantity":2}]}}
+{"type":"policy","at":"…","id":"toolu_02","tool":"create_order","decision":"allow"}
+{"type":"tool_result","at":"…","id":"toolu_02","tool":"create_order","isError":false,"ms":41,"preview":"{\"id\":\"…\",\"status\":\"PENDING\"…"}
+{"type":"policy","at":"…","id":"toolu_04","tool":"pay_order","decision":"denied-by-human"}
+```
 
 **Run it**
 
@@ -117,7 +128,7 @@ docker compose up --build --wait                  # orders, inventory, Kafka, Po
 echo "ANTHROPIC_API_KEY=sk-ant-..." > .env        # git-ignored
 npm run agent -- --trace "order 2 keyboards and pay for it"
 npm run agent:sdk -- "what is the status of my last order?"
-npm run eval                                      # 8 behaviour checks against the real model
+npm run eval                                      # 8 behaviour checks against the real model; cancels what it creates
 ```
 
 **Hand-written loop or Agent SDK?** The hand-written loop (`apps/agent/src/loop.ts`, ~120 lines) gives full control:

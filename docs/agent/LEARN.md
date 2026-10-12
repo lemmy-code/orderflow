@@ -54,8 +54,11 @@ Rules that matter:
   reply**; answer them all, in order, in **one** user message (test: *"handles several tool calls in one reply"*).
 - A failure is still a result: set **`is_error: true`** and explain in `content`. The model reads it and can correct
   itself (test: *"passes a tool error back to the model so it can recover"*).
-- You must send the assistant's reply back in the history unchanged, so the model sees its own `tool_use` blocks next
-  to your results.
+- You must send the assistant's reply back in the history **unchanged**, so the model sees its own `tool_use` blocks next
+  to your results. Current models also **think** first: their reply starts with `thinking` blocks carrying a signature.
+  Those must go back exactly as received, or the next request can fail. Our adapter keeps the raw reply (`raw`) for the
+  history and only *reads* the `text` and `tool_use` blocks (test: *"sends the assistant reply back unchanged, including
+  blocks it does not use"*). Thinking also counts toward `max_tokens`, so each reply gets 16,000.
 
 ## 3. MCP — the Model Context Protocol
 
@@ -90,7 +93,9 @@ tools (`apps/mcp-server/src/tools.ts`) show the rules:
 4. **Error messages that say what to do next.** Every API error code maps to a hint (`HINTS` in `tools.ts`): for
    `INVALID_STATE`, *"Call get_order to see the current status. A PENDING order cannot be paid until it is RESERVED."*
    That is the difference between an agent that recovers and one that gives up.
-5. **Small, typed tools.** The model gets six clear actions, not raw access to the database or the GraphQL API.
+5. **Shape results for the question.** `list_orders` returns the **newest** orders first (the server pages through the
+   API), because users ask about "my last order".
+6. **Small, typed tools.** The model gets six clear actions, not raw access to the database or the GraphQL API.
 
 ## 5. Control — making an agent safe
 
@@ -98,14 +103,18 @@ This is the part interviewers care about most (`libs/agent-policy`, `apps/agent/
 
 - **Tiers.** `read` tools run freely; `write` (`create_order`) runs; `approval` (`pay_order`, `cancel_order`) needs a
   human. Defined once in `TOOL_TIERS`, used by both agents.
-- **Default deny.** A tool on the server *without* a tier is hidden from the model and refused if requested (test:
-  *"only shows tiered tools to the model"*). Adding a dangerous tool to the server can't silently give the model new powers.
+- **Default deny.** A tool on the server *without* a tier is refused if requested; the hand-written agent also hides it
+  from the model (test: *"only shows tiered tools to the model"*). Adding a dangerous tool to the server can't silently
+  give the model new powers. The lookup uses only the table's own keys, so a tool named `constructor` or `toString`
+  can't slip through (test: *"no prototype bypass"*). In the Agent SDK version such a tool is refused by `canUseTool`
+  but still visible to the model.
 - **Human approval.** The terminal asks `Allow? [y/N]`; only `y`/`yes` approves, Enter means no
   (`parseApproval`). A denial goes back to the model as: *"The user denied this action. Do not retry it or try to achieve
   the same result another way."* Without that sentence a model may try a workaround.
 - **Limits.** 12 model steps and 60,000 tokens per task (`Budget`). That stops loops and runaway cost. The outcome is
   `limit` with the reason (`steps` or `tokens`).
 - **Truncation.** Tool results over 20,000 characters are cut, with a marker, so one huge result can't blow the budget.
+- **Least privilege.** The MCP server process gets only `PATH`, `HOME` and the API URL — never the Anthropic key.
 - **Resilience.** The Anthropic SDK retries rate limits (429) and server errors (5xx) with backoff (`maxRetries: 3`).
   If the MCP connection dies, the run ends with outcome `error` and the trace is kept.
 
@@ -134,19 +143,21 @@ Three failures and how the trace shows them:
 - **The eval** (`npm run eval`, `eval/cases.ts`) runs 8 real tasks against the real model and checks *behaviour*: the
   right tools, in the right order, with the right arguments, and no unapproved writes. It is not in CI because it costs
   money and the model is not deterministic; you run it after changing a prompt, a tool description or the model.
+  A run that crashes, hits a limit or stops early fails its case, whatever tools it managed to call; at the end the eval
+  cancels the orders it created, so stock is left as it was.
 
 ## 8. Hand-written loop vs Claude Agent SDK
 
 | | Hand-written (`apps/agent`) | Claude Agent SDK (`apps/agent-sdk`) |
 |---|---|---|
 | The loop | ~120 lines you own | provided by `query()` |
-| Permissions | `decide()` before each call | the `canUseTool` callback, using the same `decide()` |
+| Permissions | `decide()` before each call; untiered tools hidden | the `canUseTool` callback, using the same `decide()`; untiered tools refused but visible |
 | Limits | `Budget` (steps and tokens) | `maxTurns` |
 | Built-in tools | none | many (files, shell…) — we switch them all off with `tools: []` |
 | Settings | none | `settingSources: []` so your own Claude settings don't leak in |
 | Tool names | `create_order` | `mcp__orderflow__create_order` |
 | Tests | fake model, fully deterministic | needs the real model |
-| Cost and turns | our estimate from `usage` | reported in the final `result` message (`num_turns`, `total_cost_usd`) |
+| Cost and turns | our estimate from `usage` at $2 / $10 per million tokens | reported in the final `result` message (`num_turns`, `total_cost_usd`; check `is_error`, not only `subtype`) |
 
 **When to choose which:** write your own loop when you need full control — custom policy, your own logging and tests,
 any provider or model. Use the Agent SDK when you want a capable agent quickly — it brings the loop, context management,
@@ -186,7 +197,11 @@ built-in tools and sessions — and you're happy to express your rules through i
     reduce what you ask for.
 16. **Hand-written loop or Agent SDK?** — Own loop for control and testability; the SDK for speed and built-in tools. I
     built both with the same policy to compare.
-17. **How does the agent wait for an async process?** — The tool description says orders start `PENDING`; the model
+17. **Why send thinking blocks back?** — The model's reasoning is part of its turn; in a tool loop it must be returned
+    unchanged (with its signature) or the API can reject the next request.
+18. **How would you cut cost on long runs?** — Prompt caching: mark the system prompt and tool definitions with
+    `cache_control` so repeated steps read them from cache. orderflow doesn't do this yet; it's the next optimisation.
+19. **How does the agent wait for an async process?** — The tool description says orders start `PENDING`; the model
     calls `get_order` again until `RESERVED` before paying, within the step limit.
 
 ## 10. How to talk about building it
