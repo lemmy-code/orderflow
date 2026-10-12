@@ -12,11 +12,12 @@ the commit that closed the task. Plan: `docs/superpowers/plans/2026-10-12-orderf
 | 3 | MCP server tests against the real orders API (Docker) | Mon 12.10 15:27 | Mon 12.10 15:28 | ✅ 4 tests pass | `fd61f39` |
 | 4 | Agent loop: policy, approvals, limits, truncation, trace | Mon 12.10 15:28 | Mon 12.10 15:29 | ✅ 12 tests pass | `7a0c667` |
 | 5 | Real adapters (Anthropic SDK, MCP stdio, y/N approval, JSONL trace, CLI) + end-to-end test | Mon 12.10 15:29 | Mon 12.10 15:30 | ✅ e2e passes; stdio smoke: 6 tools, bad args → isError | `33a5356` |
-| 6 | Claude Agent SDK version | — | — | not started | |
+| 6 | Claude Agent SDK version | Mon 12.10 20:45 | Mon 12.10 20:46 | ✅ typecheck against the real SDK types; no-key run exits cleanly. ⚠️ **live run not verified yet (no API key)** | (this commit) |
 | 7 | Eval: 8 tasks against the real Claude | — | — | not started | |
 | 8 | README section + LEARN study guide + full suite + push | — | — | not started | |
 
 **Decisions made while building** (also in the ledger):
 - Task 1: TypeScript/Nest settings unchanged; the three SDKs installed: `@anthropic-ai/sdk` 0.133, `@modelcontextprotocol/sdk` 1.32, `@anthropic-ai/claude-agent-sdk` 0.3, `zod` 4.
 - Task 2: tests read `callTool` results as `unknown` — the SDK's result type also allows an older `toolResult` shape.
+- Task 6: the Agent SDK version reuses the hand-written agent's policy (`decide`), approval prompt and system prompt, so both agents follow identical rules.
 - Task 5: the end-to-end "model" counts assistant turns instead of wrapping the fake model (same behaviour, simpler).
