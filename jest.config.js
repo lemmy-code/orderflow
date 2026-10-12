@@ -16,7 +16,7 @@ module.exports = {
   coverageDirectory: 'coverage',
   collectCoverageFrom: ['apps/**/src/**/*.ts', 'libs/**/src/**/*.ts', '!**/main.ts', '!**/migrations/**'],
   projects: [
-    { ...base, displayName: 'unit', testMatch: ['<rootDir>/{apps,libs}/**/*.spec.ts'] },
+    { ...base, displayName: 'unit', testMatch: ['<rootDir>/{apps,libs,eval}/**/*.spec.ts'] },
     { ...base, displayName: 'int', testMatch: ['<rootDir>/test/int/**/*.int-spec.ts'], setupFilesAfterEnv: ['<rootDir>/test/support/timeout.ts'] },
     { ...base, displayName: 'e2e', testMatch: ['<rootDir>/test/e2e/**/*.e2e-spec.ts'], setupFilesAfterEnv: ['<rootDir>/test/support/timeout.ts'] },
   ],
