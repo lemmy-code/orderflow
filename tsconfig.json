@@ -20,8 +20,9 @@
       "@app/contracts": ["./libs/contracts/src"],
       "@app/contracts/*": ["./libs/contracts/src/*"],
       "@app/messaging": ["./libs/messaging/src"],
-      "@app/messaging/*": ["./libs/messaging/src/*"]
+      "@app/messaging/*": ["./libs/messaging/src/*"],
+      "@app/agent-policy": ["./libs/agent-policy/src"]
     }
   },
-  "include": ["apps/**/*.ts", "libs/**/*.ts", "test/**/*.ts", "scripts/**/*.ts"]
+  "include": ["apps/**/*.ts", "libs/**/*.ts", "test/**/*.ts", "scripts/**/*.ts", "eval/**/*.ts"]
 }

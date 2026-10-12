@@ -8,6 +8,7 @@ const base = {
     '^@app/contracts/(.*)$': '<rootDir>/libs/contracts/src/$1',
     '^@app/messaging$': '<rootDir>/libs/messaging/src',
     '^@app/messaging/(.*)$': '<rootDir>/libs/messaging/src/$1',
+    '^@app/agent-policy$': '<rootDir>/libs/agent-policy/src',
   },
 };
 
