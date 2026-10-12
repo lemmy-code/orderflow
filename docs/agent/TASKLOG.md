@@ -14,7 +14,7 @@ the commit that closed the task. Plan: `docs/superpowers/plans/2026-10-12-orderf
 | 5 | Real adapters (Anthropic SDK, MCP stdio, y/N approval, JSONL trace, CLI) + end-to-end test | Mon 12.10 15:29 | Mon 12.10 15:30 | ✅ e2e passes; stdio smoke: 6 tools, bad args → isError | `33a5356` |
 | 6 | Claude Agent SDK version | Mon 12.10 20:45 | Mon 12.10 20:46 | ✅ typecheck against the real SDK types; no-key run exits cleanly. ⚠️ **live run not verified yet (no API key)** | (this commit) |
 | 7 | Eval: 8 tasks against the real Claude | Mon 12.10 20:46 | Mon 12.10 20:46 | ✅ lint/types; all 8 checks verified with simulated good and bad runs (good → pass, bad → caught). ⚠️ **not run against the real model yet (no API key)** | (this commit) |
-| 8 | README section + LEARN study guide + full suite + push | Mon 12.10 20:47 | — | in progress | |
+| 8 | README section + LEARN study guide + full suite | Mon 12.10 20:47 | Mon 12.10 20:50 | ✅ lint, types, 100 unit + 41 integration + 7 e2e = **148/148**, also from a fresh clone with no .env | (this commit) |
 
 **Decisions made while building** (also in the ledger):
 - Task 1: TypeScript/Nest settings unchanged; the three SDKs installed: `@anthropic-ai/sdk` 0.133, `@modelcontextprotocol/sdk` 1.32, `@anthropic-ai/claude-agent-sdk` 0.3, `zod` 4.
@@ -22,3 +22,11 @@ the commit that closed the task. Plan: `docs/superpowers/plans/2026-10-12-orderf
 - Task 6: the Agent SDK version reuses the hand-written agent's policy (`decide`), approval prompt and system prompt, so both agents follow identical rules.
 - Task 7: the eval denies every approval, so a live eval never pays or cancels anything; the "over the limit" case checks that the model *explains* the 1000-per-line limit.
 - Task 5: the end-to-end "model" counts assistant turns instead of wrapping the fake model (same behaviour, simpler).
+
+## Still open
+
+| What | Status |
+|---|---|
+| Final review by an independent reviewer (most capable model) | next |
+| Merge `feat/agent` into `main` and push; CI green on GitHub | after the review |
+| **Live run with the real Claude** (`npm run agent`, `npm run agent:sdk`, `npm run eval`) | ⚠️ needs an `ANTHROPIC_API_KEY` in `.env` — not done |
