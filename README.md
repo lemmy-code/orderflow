@@ -86,14 +86,55 @@ CI runs lint, typecheck and all three layers on every push, and a second job boo
 `scripts/smoke.sh`. Locally you need Node 24.9+ and a running Docker engine (Docker Desktop, OrbStack or Colima; with Colima also
 `export TESTCONTAINERS_DOCKER_SOCKET_OVERRIDE=/var/run/docker.sock`).
 
+## AI agent
+
+orderflow also has an AI side: an **MCP server** over the orders API, and an **application that drives Claude** through
+it, built twice: once as a hand-written loop on the Anthropic SDK, once on the Claude Agent SDK.
+
+```mermaid
+flowchart LR
+  you([you]) --> agent["orderflow-agent<br/>Anthropic SDK · tool-use loop<br/>policy · approvals · limits · trace"]
+  you --> sdk["orderflow-agent-sdk<br/>Claude Agent SDK<br/>same policy"]
+  agent -- "MCP over stdio" --> mcp["orderflow-mcp<br/>6 typed tools (Zod)"]
+  sdk -- "MCP over stdio" --> mcp
+  mcp -- GraphQL --> orders[orders API]
+```
+
+| Tool | Tier | What it does |
+|---|---|---|
+| `list_products` | read | the catalogue with ids and prices |
+| `get_order`, `list_orders` | read | status, total, items |
+| `create_order` | write | creates a `PENDING` order; inventory reserves stock asynchronously |
+| `pay_order`, `cancel_order` | **needs your approval** | the agent asks `Allow? [y/N]` first; Enter means no |
+
+**Control:** tools without a tier are hidden and refused (default deny) · 12 model steps and 60,000 tokens per task ·
+tool results capped at 20,000 characters · API retries on 429/5xx · every step written to `.agent-traces/*.jsonl`.
+
+**Run it**
+
+```bash
+docker compose up --build --wait                  # orders, inventory, Kafka, Postgres
+echo "ANTHROPIC_API_KEY=sk-ant-..." > .env        # git-ignored
+npm run agent -- --trace "order 2 keyboards and pay for it"
+npm run agent:sdk -- "what is the status of my last order?"
+npm run eval                                      # 8 behaviour checks against the real model
+```
+
+**Hand-written loop or Agent SDK?** The hand-written loop (`apps/agent/src/loop.ts`, ~120 lines) gives full control:
+your own policy, limits, trace and tests with a fake model. The Agent SDK gives you the loop, context management and
+built-in tools for free, with policy through its `canUseTool` hook. Both use the same tiers from `libs/agent-policy`.
+More in [docs/agent/LEARN.md](docs/agent/LEARN.md).
+
 ## Project docs
 
 - [Design spec](docs/superpowers/specs/2026-10-07-orderflow-design.md): requirements, architecture, failure handling, and
   the revisions made during planning and review (§10).
 - [Implementation plan](docs/superpowers/plans/2026-10-07-orderflow.md): the task-by-task, test-first plan it was built
   from.
+- [Agent design spec](docs/superpowers/specs/2026-10-12-orderflow-agent-design.md), [agent plan](docs/superpowers/plans/2026-10-12-orderflow-agent.md),
+  [task log](docs/agent/TASKLOG.md) and the [study guide](docs/agent/LEARN.md).
 
 ## Stack
 
-TypeScript · NestJS 12 · GraphQL (Apollo, code-first) · PostgreSQL · TypeORM · Kafka (KafkaJS) · Jest · Supertest ·
-Testcontainers · Docker Compose · GitHub Actions
+TypeScript · NestJS 12 · GraphQL (Apollo, code-first) · PostgreSQL · TypeORM · Kafka (KafkaJS) · Anthropic SDK ·
+Claude Agent SDK · MCP TypeScript SDK · Zod · Jest · Supertest · Testcontainers · Docker Compose · GitHub Actions
